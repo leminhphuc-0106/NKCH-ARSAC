@@ -1,0 +1,91 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build HMI (Debug)",
+            "type": "shell",
+            "command": "dotnet",
+            "args": [
+                "build",
+                "${workspaceFolder}/HMI/HMI.csproj",
+                "--configuration",
+                "Debug",
+                "--property:Platform=x64"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": "$msCompile",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Build PC",
+            "type": "shell",
+            "command": "C:/msys64/ucrt64/bin/g++.exe",
+            "args": [
+                "-g",
+                "calculate.cpp",
+                "Calculate_Lib/Calculate_Lib.cpp",
+                "-ICalculate_Lib",
+                "-o",
+                "calculate.exe"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/calculating"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "Run PC",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "& \"${workspaceFolder}/calculating/calculate.exe\""
+            ],
+            "dependsOn": "Build PC",
+            "options": {
+                "cwd": "${workspaceFolder}/calculating"
+            }
+        },
+        {
+            "label": "Upload ESP32 (auto port)",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}/scripts/upload_esp32.ps1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/mega2560"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "F5: Build + Upload ESP32, Build HMI",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Upload ESP32 (auto port)",
+                "Build HMI (Debug)"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "Run Both",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Upload ESP32 (auto port)",
+                "Run PC"
+            ]
+        }
+    ]
+}

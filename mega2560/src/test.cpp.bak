@@ -1,0 +1,95 @@
+#include <AFMotor.h>
+#include <Arduino.h>
+#include <math.h>
+
+#define TEST_PINA 20
+#define TEST_PINB 21
+
+AF_DCMotor motor(2);
+
+volatile int state_2bit = 0, last_state = 0, state_4bit = 0, count_num = 0;
+String c;
+float a = 0, pwm = 0;
+unsigned long t = 0;
+
+void count() {
+  state_2bit = (digitalRead(TEST_PINA) << 1) | (digitalRead(TEST_PINB));
+  state_4bit = (last_state << 2) | (state_2bit);
+  switch (state_4bit) {
+  case 0b0001:
+  case 0b0111:
+  case 0b1110:
+  case 0b1000:
+    count_num++;
+    break;
+  case 0b0010:
+  case 0b1011:
+  case 0b1101:
+  case 0b0100:
+    count_num--;
+    break;
+  }
+  last_state = state_2bit;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TEST_PINA, INPUT_PULLUP);
+  pinMode(TEST_PINB, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(TEST_PINA), count, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(TEST_PINB), count, CHANGE);
+
+  motor.run(FORWARD);
+  motor.setSpeed(0);
+
+  Serial.println("System ready, input the angle: ");
+}
+
+unsigned long lastTime = 0;
+const unsigned long interval = 60000; // 60s
+
+void loop() {
+    if (count_num == 937) {
+    motor.run(BRAKE);
+    motor.setSpeed(0);
+    return;
+  }
+  motor.run(FORWARD);
+  motor.setSpeed(60);
+  Serial.println(">> Count: " + String(count_num) + "  /  ");
+  
+  /*
+  if (Serial.available()) {
+    c = Serial.readStringUntil('\n');
+    a = c.toFloat();
+    if (c.length() > 0)
+      Serial.print(">> Angle: " + String(a) + ">> PWM: " + String(pwm));
+  }
+  pwm = a * 937 / 360;
+  float error = pwm - count_num;
+  if (error >= 937/360) Serial.println (String(error) + " / " + String (millis() / 1000));
+  if ((int)round(error) > 0) {
+    motor.setSpeed(error);
+    motor.run(FORWARD);
+  } else if ((int)round(error) < 0) {
+    motor.setSpeed(abs(error));
+    motor.run(BACKWARD);
+  } else
+    motor.run(RELEASE);
+  */
+
+  /*
+      unsigned long now = millis();
+
+      if (now - lastTime >= interval) {
+          lastTime += interval;  // chuẩn hơn gán = now
+
+          Serial.print(">> Count: ");
+          Serial.print(count_num);
+          Serial.print("  /  ");
+          Serial.println(now / 1000);
+
+          count_num = 0;
+      }*/
+}

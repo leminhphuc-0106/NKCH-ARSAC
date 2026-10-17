@@ -1,0 +1,70 @@
+#include "EncoderPCNT.h"
+#include "ESP32Config.h"
+
+static pcnt_unit_handle_t units[2] = {};
+static int32_t offsets[2] = {};
+static int16_t previousRaw[2] = {};
+static int32_t accumulatedWraps[2] = {};
+
+static void configure_quadrature(int index, gpio_num_t a, gpio_num_t b) {
+  pcnt_unit_config_t unit_config = {};
+  unit_config.low_limit = INT16_MIN;
+  unit_config.high_limit = INT16_MAX;
+  ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &units[index]));
+  pcnt_glitch_filter_config_t filter = {.max_glitch_ns = 1000};
+  ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(units[index], &filter));
+
+  pcnt_chan_config_t a_config = {.edge_gpio_num = a, .level_gpio_num = b};
+  pcnt_channel_handle_t channel_a = nullptr;
+  ESP_ERROR_CHECK(pcnt_new_channel(units[index], &a_config, &channel_a));
+  ESP_ERROR_CHECK(
+      pcnt_channel_set_edge_action(channel_a, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                   PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+  ESP_ERROR_CHECK(
+      pcnt_channel_set_level_action(channel_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                    PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+  pcnt_chan_config_t b_config = {.edge_gpio_num = b, .level_gpio_num = a};
+  pcnt_channel_handle_t channel_b = nullptr;
+  ESP_ERROR_CHECK(pcnt_new_channel(units[index], &b_config, &channel_b));
+  ESP_ERROR_CHECK(
+      pcnt_channel_set_edge_action(channel_b, PCNT_CHANNEL_EDGE_ACTION_DECREASE,
+                                   PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+  ESP_ERROR_CHECK(
+      pcnt_channel_set_level_action(channel_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                    PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+  ESP_ERROR_CHECK(pcnt_unit_enable(units[index]));
+  ESP_ERROR_CHECK(pcnt_unit_clear_count(units[index]));
+  ESP_ERROR_CHECK(pcnt_unit_start(units[index]));
+}
+
+void pcnt_configuration() {
+  configure_quadrature(0, MOTOR1_ENC_A, MOTOR1_ENC_B);
+  configure_quadrature(1, MOTOR2_ENC_A, MOTOR2_ENC_B);
+}
+static int32_t read_count(int index) {
+  int value = 0;
+  ESP_ERROR_CHECK(pcnt_unit_get_count(units[index], &value));
+  const int16_t raw = static_cast<int16_t>(value);
+  const int32_t delta = static_cast<int32_t>(raw) - previousRaw[index];
+  if (delta > 30000)
+    accumulatedWraps[index] -= 65536;
+  if (delta < -30000)
+    accumulatedWraps[index] += 65536;
+  previousRaw[index] = raw;
+  return accumulatedWraps[index] + raw + offsets[index];
+}
+int32_t encoder1_count() { return read_count(0); }
+int32_t encoder2_count() { return read_count(1); }
+void encoder1_reset(int32_t count) {
+  offsets[0] = count;
+  previousRaw[0] = 0;
+  accumulatedWraps[0] = 0;
+  ESP_ERROR_CHECK(pcnt_unit_clear_count(units[0]));
+}
+void encoder2_reset(int32_t count) {
+  offsets[1] = count;
+  previousRaw[1] = 0;
+  accumulatedWraps[1] = 0;
+  ESP_ERROR_CHECK(pcnt_unit_clear_count(units[1]));
+}

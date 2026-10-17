@@ -1,0 +1,33 @@
+﻿# Build artifacts
+**/bin/
+**/obj/
+**/.pio/
+**/build/
+**/CMakeFiles/
+**/CMakeCache.txt/
+**/compile_commands.json
+*.obj
+*.exe
+*.dll
+*.pdb
+
+# Runtime logs and generated telemetry
+*.log
+telemetry.csv
+trajectory_*.csv
+target_angle_audit.csv
+project_scan.txt
+tensorboard_adaptive_pid_sac/
+tensorboard_residual_sac/
+
+# Local IDE files and temporary backups
+.vs/
+.vscode/tasks.json.backup
+**/tasks.json.backup
+_prechange_backup_20260922/
+
+# Python-generated files
+__pycache__/
+*.pyc
+.venv/
+venv/

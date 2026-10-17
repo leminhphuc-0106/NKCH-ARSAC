@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+    <None Include="..\calculating\RobotKinematicsNative\RobotKinematicsNative.dll"
+          Link="RobotKinematicsNative.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="BuildRobotKinematicsNative" BeforeTargets="PrepareForBuild">
+    <Exec Command="g++ -std=c++17 -shared -static-libgcc -static-libstdc++ -o &quot;$(MSBuildProjectDirectory)\..\calculating\RobotKinematicsNative\RobotKinematicsNative.dll&quot; &quot;$(MSBuildProjectDirectory)\..\calculating\RobotKinematicsNative\RobotKinematicsNative.cpp&quot; &quot;$(MSBuildProjectDirectory)\..\calculating\Calculate_Lib\Calculate_Lib.cpp&quot;" />
+  </Target>
+</Project>

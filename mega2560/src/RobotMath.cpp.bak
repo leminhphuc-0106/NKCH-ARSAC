@@ -1,0 +1,150 @@
+#include "RobotMath.h"
+using namespace std;
+
+const float mass_link[2] = {0.1362f, 0.0826f};
+const float link_length[2] = {20.0f, 15.0f};
+const float center_length[2] = {7.5f, 10.0f};
+bool INPUT_DATA::RRplanar_in(point &target, joint &theta) {
+  const float x = target.x, y = target.y, l1 = link_length[0],
+              l2 = link_length[1], r = sqrt(x * x + y * y);
+  if (r > l1 + l2 || r < fabs(l1 - l2))
+    return false;
+  const float c = (x * x + y * y - l1 * l1 - l2 * l2) / (2 * l1 * l2);
+  theta.theta2 = acos(fmax(-1.0f, fmin(1.0f, c)));
+  theta.theta1 =
+      atan2(y, x) - atan2(l2 * sin(theta.theta2), l1 + l2 * cos(theta.theta2));
+  return theta.theta1 >= 0 && theta.theta1 <= PI && fk_Match(theta, target);
+}
+
+bool INPUT_DATA::fk_Match(joint &theta, point &target) {
+  const float x = link_length[0] * cos(theta.theta1) +
+                  link_length[1] * cos(theta.theta1 + theta.theta2),
+              y = link_length[0] * sin(theta.theta1) +
+                  link_length[1] * sin(theta.theta1 + theta.theta2);
+  return fabs(x - target.x) <= 1 && fabs(y - target.y) <= 1;
+}
+
+point INPUT_DATA::forwardKinematics(const joint &theta) const {
+  return {static_cast<int>(
+              lround(link_length[0] * cos(theta.theta1) +
+                     link_length[1] * cos(theta.theta1 + theta.theta2))),
+          static_cast<int>(
+              lround(link_length[0] * sin(theta.theta1) +
+                     link_length[1] * sin(theta.theta1 + theta.theta2))),
+          0};
+}
+
+bool INPUT_DATA::checkLine2R(const point &start, const point &end,
+                             const joint &, const joint &) {
+  joint test{};
+  point sample = start;
+  for (int i = 0; i <= 20; ++i) {
+    moveLine(start, end, sample, i / 20.0f);
+    if (!RRplanar_in(sample, test))
+      return false;
+  }
+  return true;
+}
+
+bool INPUT_DATA::checkCircle2R(const circle &value) {
+  joint test{};
+  point sample{};
+  for (int i = 0; i < 32; ++i) {
+    moveCircle(value, sample, i / 32.0f);
+    if (!RRplanar_in(sample, test))
+      return false;
+  }
+  return value.radius > 0;
+}
+
+point INPUT_DATA::projectionCircle(const circle &value, point current) const {
+  const float dx = current.x - value.p.x, dy = current.y - value.p.y;
+  const float distance = sqrt(dx * dx + dy * dy);
+  if (distance < 1e-4f)
+    return {value.p.x + value.radius, value.p.y, current.z};
+  return {static_cast<int>(value.p.x + dx * value.radius / distance),
+          static_cast<int>(value.p.y + dy * value.radius / distance),
+          current.z};
+}
+
+void INPUT_DATA::moveLine(const point &start, const point &end, point &result,
+                          float u) const {
+  u = fmax(0.0f, fmin(1.0f, u));
+  result = {static_cast<int>(lround(start.x + (end.x - start.x) * u)),
+            static_cast<int>(lround(start.y + (end.y - start.y) * u)),
+            static_cast<int>(lround(start.z + (end.z - start.z) * u))};
+}
+
+void INPUT_DATA::moveCircle(const circle &value, point &result, float u) const {
+  const float angle = 2.0f * PI * u;
+  result = {static_cast<int>(lround(value.p.x + value.radius * cos(angle))),
+            static_cast<int>(lround(value.p.y + value.radius * sin(angle))),
+            value.p.z};
+}
+
+void PROCESSING::setPID(float kp, float ki, float kd) {
+  kp_ = kp;
+  ki_ = ki;
+  kd_ = kd;
+  previousError_ = 0;
+  integral_ = 0;
+}
+
+void PROCESSING::resetPID() {
+  previousError_ = 0;
+  integral_ = 0;
+}
+
+float PROCESSING::PIDcalc(float error, float dt) {
+  if (dt <= 0)
+    return 0;
+  constexpr float integralLimit = 255.0f;
+  const float candidateIntegral = integral_ + error * dt;
+  const float candidateOutput = kp_ * error + ki_ * candidateIntegral;
+  if (ki_ == 0 || fabs(candidateOutput) < 255.0f ||
+      (candidateOutput > 255.0f && error < 0) ||
+      (candidateOutput < -255.0f && error > 0)) {
+    integral_ = fmax(-integralLimit, fmin(integralLimit, candidateIntegral));
+  }
+  const float derivative = (error - previousError_) / dt;
+  previousError_ = error;
+  return kp_ * error + ki_ * integral_ + kd_ * derivative;
+}
+
+float PROCESSING::interQuintic(float u) const {
+  u = fmax(0.0f, fmin(1.0f, u));
+  return 10 * pow(u, 5) - 15 * pow(u, 4) + 6 * pow(u, 3);
+}
+
+float PROCESSING::movePoint(float start, float target, float u) const {
+  return start + (target - start) * u;
+}
+
+Torque PROCESSING::MassMatrix(joint t) {
+  return {mass_link[0] * center_length[0] * center_length[0] +
+              mass_link[1] *
+                  (center_length[0] * center_length[0] +
+                   center_length[1] * center_length[1] +
+                   2 * center_length[0] * center_length[1] * cos(t.theta2)),
+          mass_link[1] * (center_length[1] * center_length[1] +
+                          center_length[0] * center_length[1] * cos(t.theta2))};
+}
+
+Torque PROCESSING::CoriolisMatrix(joint t, Torque dq) {
+  const float h =
+      mass_link[1] * center_length[0] * center_length[1] * sin(t.theta2);
+  return {-h * (2 * dq.t1 * dq.t2 + dq.t2 * dq.t2), h * dq.t1 * dq.t1};
+}
+
+Torque PROCESSING::GravityMatrix(joint t) {
+  return {
+      (mass_link[0] + mass_link[1]) * center_length[0] * 9.78f * cos(t.theta1) +
+          mass_link[1] * center_length[1] * 9.78f * cos(t.theta1 + t.theta2),
+      mass_link[1] * center_length[1] * 9.78f * cos(t.theta1 + t.theta2)};
+}
+
+Torque PROCESSING::Torquecalc(joint t, Torque dq, Torque ddq) {
+  const Torque m = MassMatrix(t), c = CoriolisMatrix(t, dq),
+               g = GravityMatrix(t);
+  return {m.t1 * ddq.t1 + c.t1 + g.t1, m.t2 * ddq.t2 + c.t2 + g.t2};
+}

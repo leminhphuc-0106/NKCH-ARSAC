@@ -1,0 +1,60 @@
+#include "MotorControl.h"
+#include "ESP32Config.h"
+#include <algorithm>
+#include <cmath>
+#include <driver/ledc.h>
+
+static constexpr ledc_mode_t PWM_MODE = LEDC_LOW_SPEED_MODE;
+static constexpr ledc_timer_t PWM_TIMER = LEDC_TIMER_0;
+static constexpr ledc_channel_t PWM_CH1 = LEDC_CHANNEL_2;
+static constexpr ledc_channel_t PWM_CH2 = LEDC_CHANNEL_3;
+static constexpr uint32_t PWM_FREQUENCY_HZ = 20000;
+static constexpr uint8_t PWM_RESOLUTION = 8;
+
+static void write_motor(float pwm, gpio_num_t in0, gpio_num_t in1,
+                        ledc_channel_t channel) {
+  const int duty =
+      std::clamp(static_cast<int>(std::lround(std::fabs(pwm))), 0, 255);
+  if (pwm > 0) {
+    gpio_set_level(STBY, 1);
+    gpio_set_level(STBY, 1);
+    gpio_set_level(in0, 1);
+    gpio_set_level(in1, 0);
+  } else if (pwm < 0) {
+    gpio_set_level(in0, 0);
+    gpio_set_level(in1, 1);
+  } else {
+    gpio_set_level(in0, 0);
+    gpio_set_level(in1, 0);
+  }
+  ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, channel, pwm == 0 ? 0 : duty));
+  ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, channel));
+}
+
+void motor_configuration() {
+  ledc_timer_config_t timer = {};
+  timer.speed_mode = PWM_MODE;
+  timer.timer_num = PWM_TIMER;
+  timer.duty_resolution = LEDC_TIMER_8_BIT;
+  timer.freq_hz = PWM_FREQUENCY_HZ;
+  timer.clk_cfg = LEDC_AUTO_CLK;
+  ESP_ERROR_CHECK(ledc_timer_config(&timer));
+  ledc_channel_config_t channels[2] = {};
+  channels[0].gpio_num = PWM_A;
+  channels[0].speed_mode = PWM_MODE;
+  channels[0].channel = PWM_CH1;
+  channels[0].timer_sel = PWM_TIMER;
+  channels[1].gpio_num = PWM_B;
+  channels[1].speed_mode = PWM_MODE;
+  channels[1].channel = PWM_CH2;
+  channels[1].timer_sel = PWM_TIMER;
+  for (auto &channel : channels)
+    ESP_ERROR_CHECK(ledc_channel_config(&channel));
+}
+void motor1_running(float pwm) { write_motor(pwm, IN_A0, IN_A1, PWM_CH1); }
+void motor2_running(float pwm) { write_motor(pwm, IN_B0, IN_B1, PWM_CH2); }
+void motors_stop() {
+  motor1_running(0);
+  motor2_running(0);
+  gpio_set_level(STBY, 0);
+}

@@ -1,0 +1,98 @@
+#include "ESP32Config.h"
+#include "MotorControl.h"
+
+QueueHandle_t cmdQueue = nullptr;
+QueueHandle_t bufferQueue = nullptr;
+TaskHandle_t controlTaskHandle = nullptr;
+static gptimer_handle_t controlTimer = nullptr;
+
+static bool IRAM_ATTR control_timer_callback(gptimer_handle_t,
+                                             const gptimer_alarm_event_data_t *,
+                                             void *) {
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  if (controlTaskHandle != nullptr)
+    vTaskNotifyGiveFromISR(controlTaskHandle, &higherPriorityTaskWoken);
+  return higherPriorityTaskWoken == pdTRUE;
+}
+
+void gpio_configuration() {
+  gpio_config_t output = {};
+  output.pin_bit_mask = (1ULL << IN_A0) | (1ULL << IN_A1) | (1ULL << IN_B0) |
+                        (1ULL << IN_B1) | (1ULL << STBY) | (1ULL << R_EN) |
+                        (1ULL << L_EN);
+  output.mode = GPIO_MODE_OUTPUT;
+  output.pull_up_en = GPIO_PULLUP_DISABLE;
+  output.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  output.intr_type = GPIO_INTR_DISABLE;
+  gpio_config(&output);
+  gpio_set_level(STBY, 1);
+  gpio_set_level(R_EN, 1);
+  gpio_set_level(L_EN, 1);
+
+  gpio_config_t encoder = {};
+  encoder.pin_bit_mask = (1ULL << MOTOR1_ENC_A) | (1ULL << MOTOR1_ENC_B) |
+                         (1ULL << MOTOR2_ENC_A) | (1ULL << MOTOR2_ENC_B);
+  encoder.mode = GPIO_MODE_INPUT;
+  // GPIO34 and GPIO35 are input-only and have no internal pull resistors.
+  // The encoder wiring must provide external pull-ups on these lines.
+  encoder.pull_up_en = GPIO_PULLUP_DISABLE;
+  encoder.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  encoder.intr_type = GPIO_INTR_DISABLE;
+  gpio_config(&encoder);
+#if defined(HOME1_GPIO) || defined(HOME2_GPIO) || defined(STOP_GPIO)
+  gpio_config_t safety = {};
+  safety.mode = GPIO_MODE_INPUT;
+  safety.pull_up_en = GPIO_PULLUP_ENABLE;
+  safety.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  safety.intr_type = GPIO_INTR_DISABLE;
+#if defined(HOME1_GPIO)
+  safety.pin_bit_mask |= 1ULL << HOME1_GPIO;
+#endif
+#if defined(HOME2_GPIO)
+  safety.pin_bit_mask |= 1ULL << HOME2_GPIO;
+#endif
+#if defined(STOP_GPIO)
+  safety.pin_bit_mask |= 1ULL << STOP_GPIO;
+#endif
+  gpio_config(&safety);
+#endif
+}
+
+void timer_configuration() {
+  gptimer_config_t config = {};
+  config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+  config.direction = GPTIMER_COUNT_UP;
+  config.resolution_hz = TIMER_RESOLUTION_HZ;
+  ESP_ERROR_CHECK(gptimer_new_timer(&config, &controlTimer));
+  gptimer_alarm_config_t alarm = {};
+  alarm.alarm_count = TIMER_ALARM_VALUE;
+  alarm.reload_count = 0;
+  alarm.flags.auto_reload_on_alarm = true;
+  ESP_ERROR_CHECK(gptimer_set_alarm_action(controlTimer, &alarm));
+  gptimer_event_callbacks_t callbacks = {.on_alarm = control_timer_callback};
+  ESP_ERROR_CHECK(
+      gptimer_register_event_callbacks(controlTimer, &callbacks, nullptr));
+}
+
+void start_control_timer() {
+  ESP_ERROR_CHECK(gptimer_enable(controlTimer));
+  ESP_ERROR_CHECK(gptimer_start(controlTimer));
+}
+
+void pwm_configuration() { motor_configuration(); }
+void adc_configuration() {}
+void uart_configuration() {
+  const uart_config_t config = {
+      .baud_rate = SERIAL_BAUD,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_APB,
+  };
+  ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, 512, 512, 0, nullptr, 0));
+  ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &config));
+  ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN,
+                               UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+void i2c_configuration() {}

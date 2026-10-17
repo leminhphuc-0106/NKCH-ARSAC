@@ -1,0 +1,16 @@
+{
+    "C_Cpp.default.compilerPath": "C:/msys64/ucrt64/bin/g++.exe",
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:system",
+            "packageManager": "ms-python.python:pip"
+        }
+    ],
+    "files.exclude": {
+        "**/obj": true,
+        "**/bin": true,
+        "**/.vs": true
+    },
+    "cmake.sourceDirectory": "E:/CODE/Arduino/codecode/mega2560"
+}

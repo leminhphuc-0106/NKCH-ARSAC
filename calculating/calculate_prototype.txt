@@ -1,0 +1,999 @@
+﻿#include "Calculate_Lib.h"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <devguid.h>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <mutex>
+#include <setupapi.h>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <windows.h>
+
+using namespace std;
+using namespace chrono;
+
+mutex programMutex;
+mutex serialMutex;
+mutex consoleMutex;
+// ===== TELEMETRY BUFFER =====
+// Protects all trajectory-specific telemetry state below.
+mutex telemetryFileMutex;
+mutex telemetryMutex; // Retained only by obsolete helpers; not used by RX
+                      // logging.
+steady_clock::time_point trajectoryStart;
+steady_clock::time_point trajectoryTelemetryStart; // Legacy helper state; no
+                                                   // longer used by RX logging.
+steady_clock::time_point telemetrySessionStart;
+ofstream telemetryLog;
+uint64_t telemetryPacketCount = 0;
+const char *const telemetryFilePath =
+    "E:\\CODE\\Arduino\\codecode\\telemetry.csv";
+
+#define DEBUG_TELEMETRY 0
+
+Command cmd;
+
+#define DIRECT_A 7
+#define DIRECT_B 8
+#define ENC_A 18
+#define ENC_B 19
+#define PWM_1 6
+
+#define DIRECT_C 2
+#define DIRECT_D 4
+#define ENC_C 20
+#define ENC_D 21
+#define PWM_2 3
+
+#define STBY 5
+#define pwm_num1 11880
+#define pwm_num2 1980
+
+DATAA indata;
+PROCESSING encode1(ENC_A, ENC_B, DIRECT_A, DIRECT_B, PWM_1),
+    encode2(ENC_C, ENC_D, DIRECT_C, DIRECT_D, PWM_2);
+
+MOVE_MODE Mode = NORMAL;
+bool loadingProgram = false;
+bool runProgram = false;
+
+HANDLE serialHandle = INVALID_HANDLE_VALUE;
+double currentQ1 = 0.0;
+double currentQ2 = PI;
+bool trajectoryActive = false;
+double trajectoryDuration = 0.0;
+
+uint16_t totalCommand = 0, loadedCommand = 0, executedCommand = 0;
+
+// Debug instrumentation counters
+uint64_t controlCycle = 0;
+uint64_t txPacketCount = 0;
+uint64_t trajectoryInterpolationCycles = 0;
+
+point Point = {0}, startPoint = {0}, targetPoint = {0};
+joint theta = {0}, startTheta = {0}, targetTheta = {0};
+stateTheta ThetaState = {0};
+circle Circle = {0};
+
+boolean checkData = false, isDone1 = false, isDone2 = false, isHoming1 = false,
+        isHoming2 = false, isMoving = false, isStop = false,
+        isStartPoint1 = false, isStartPoint2 = false;
+
+char bug[2];
+
+uint8_t buffer[20];
+uint8_t length = 0;
+char line[50];
+int32_t pulseData1 = 0, pulseData2 = 0;
+
+uint8_t cmdBuffer[20];
+uint8_t cmdLength = 0;
+boolean hasCmd = false;
+
+// Mega -> PC telemetry is 11 bytes: 55 AA, two signed int32 counts (big
+// endian), then the low byte of the sum of the eight count bytes.
+enum class TelemetryParserState {
+  WaitHeader1,
+  WaitHeader2,
+  ReadData,
+  ReadChecksum
+};
+
+struct EncoderTelemetry {
+  double pcTime;
+  int32_t count1;
+  int32_t count2;
+  double q1Actual;
+  double q2Actual;
+};
+
+// ===== TELEMETRY BUFFER =====
+vector<EncoderTelemetry> telemetryBuffer;
+bool telemetryRecording = false;
+uint64_t trajectoryID = 0;
+
+class TelemetryParser {
+public:
+  bool push(uint8_t byteIn, int16_t &count1, int16_t &count2) {
+    switch (state_) {
+    case TelemetryParserState::WaitHeader1:
+      if (byteIn == 0x55)
+        state_ = TelemetryParserState::WaitHeader2;
+      break;
+    case TelemetryParserState::WaitHeader2:
+      if (byteIn == 0xAA) {
+        dataIndex_ = 0;
+        state_ = TelemetryParserState::ReadData;
+      } else {
+        // This byte may be the first header byte of the next frame.
+        state_ = (byteIn == 0x55) ? TelemetryParserState::WaitHeader2
+                                  : TelemetryParserState::WaitHeader1;
+      }
+      break;
+    case TelemetryParserState::ReadData:
+      data_[dataIndex_++] = byteIn;
+      if (dataIndex_ == sizeof(data_))
+        state_ = TelemetryParserState::ReadChecksum;
+      break;
+    case TelemetryParserState::ReadChecksum: {
+      uint8_t checksum = 0;
+      for (uint8_t dataByte : data_)
+        checksum += dataByte;
+      state_ = TelemetryParserState::WaitHeader1;
+      if (checksum != byteIn)
+        return false;
+
+      count1 = static_cast<int16_t>((static_cast<uint16_t>(data_[0]) << 8) |
+                                    data_[1]);
+      count2 = static_cast<int16_t>((static_cast<uint16_t>(data_[2]) << 8) |
+                                    data_[3]);
+      return true;
+    }
+    }
+    return false;
+  }
+
+private:
+  TelemetryParserState state_ = TelemetryParserState::WaitHeader1;
+  uint8_t data_[4] = {};
+  size_t dataIndex_ = 0;
+};
+
+void handleTelemetry(const EncoderTelemetry &telemetry) {
+#if DEBUG_TELEMETRY
+  {
+    lock_guard<mutex> lock(consoleMutex);
+    cout << fixed << setprecision(6) << "[RX ENCODER] t=" << telemetry.pcTime
+         << " count1=" << telemetry.count1 << " count2=" << telemetry.count2
+         << " q1=" << telemetry.q1Actual << " q2=" << telemetry.q2Actual
+         << '\n';
+  }
+#endif
+}
+/*
+// ===== TELEMETRY START =====
+void startTrajectoryTelemetry() {
+  uint64_t newTrajectoryID;
+  {
+    lock_guard<mutex> lock(telemetryMutex);
+    ++trajectoryID;
+    newTrajectoryID = trajectoryID;
+    telemetryBuffer.clear();
+    trajectoryTelemetryStart = steady_clock::now();
+    telemetryRecording = true;
+  }
+  lock_guard<mutex> consoleLock(consoleMutex);
+  cout << "[TELEMETRY START]\ntrajectory = " << newTrajectoryID << endl;
+}
+
+// ===== TELEMETRY SAVE =====
+void saveTrajectoryTelemetry(uint64_t completedTrajectoryID) {
+  vector<EncoderTelemetry> samples;
+  {
+    lock_guard<mutex> lock(telemetryMutex);
+    samples = telemetryBuffer;
+  }
+
+  ostringstream filenameBuilder;
+  filenameBuilder << "trajectory_" << setfill('0') << setw(3)
+                  << completedTrajectoryID << ".csv";
+
+  const filesystem::path telemetryDirectory("E:\\CODE\\Arduino\\codecode");
+  error_code filesystemError;
+  if (!filesystem::is_directory(telemetryDirectory, filesystemError)) {
+    lock_guard<mutex> consoleLock(consoleMutex);
+    cerr << "[TELEMETRY SAVE ERROR] Output directory does not exist or is not "
+            "accessible: "
+         << telemetryDirectory.string();
+    if (filesystemError)
+      cerr << " (" << filesystemError.message() << ')';
+    cerr << endl;
+    return;
+  }
+
+  const filesystem::path outputPath =
+      telemetryDirectory / filenameBuilder.str();
+  const string filename = outputPath.string();
+
+  ofstream logFile(filename, ios::out | ios::trunc);
+  if (!logFile.is_open()) {
+    lock_guard<mutex> consoleLock(consoleMutex);
+    cerr << "[TELEMETRY SAVE ERROR] Could not open " << filename << endl;
+    return;
+  }
+
+  logFile << "time,count1,count2,q1_actual,q2_actual\n";
+  logFile << fixed << setprecision(9);
+  for (const EncoderTelemetry &sample : samples) {
+    logFile << sample.pcTime << ',' << sample.count1 << ',' << sample.count2
+            << ',' << sample.q1Actual << ',' << sample.q2Actual << '\n';
+  }
+  logFile.close();
+
+  // No samples can be appended after telemetryRecording was disabled. Clear
+  // only after the complete snapshot has been written successfully.
+  {
+    lock_guard<mutex> lock(telemetryMutex);
+    telemetryBuffer.clear();
+  }
+
+  lock_guard<mutex> consoleLock(consoleMutex);
+  cout << "[TELEMETRY SAVE]\ntrajectory = " << completedTrajectoryID
+       << "\nsamples = " << samples.size() << "\nfile = " << filename << endl;
+}
+
+void stopAndSaveTrajectoryTelemetry() {
+  uint64_t completedTrajectoryID;
+  {
+    lock_guard<mutex> lock(telemetryMutex);
+    telemetryRecording = false;
+    completedTrajectoryID = trajectoryID;
+  }
+  saveTrajectoryTelemetry(completedTrajectoryID);
+}
+
+// Runs separately from command input and trajectory transmission. ReadFile has
+// short COM timeouts, and serialMutex covers only the read operation itself.
+void telemetryReceiveLoop() {
+  TelemetryParser parser;
+
+  while (serialHandle != INVALID_HANDLE_VALUE) {
+    uint8_t rxBuffer[64];
+    DWORD bytesRead = 0;
+    BOOL readOk;
+    {
+      lock_guard<mutex> lock(serialMutex);
+      readOk = ReadFile(serialHandle, rxBuffer, sizeof(rxBuffer), &bytesRead,
+                        nullptr);
+    }
+    if (!readOk) {
+      this_thread::sleep_for(chrono::milliseconds(2));
+      continue;
+    }
+    for (DWORD i = 0; i < bytesRead; ++i) {
+      int16_t count1;
+      int16_t count2;
+      if (!parser.push(rxBuffer[i], count1, count2))
+        continue;
+
+      EncoderTelemetry telemetry = {0.0, count1, count2,
+                                    count1 * 2.0 * PI / pwm_num1,
+                                    count2 * 2.0 * PI / pwm_num2};
+      {
+        lock_guard<mutex> lock(telemetryFileMutex);
+        telemetry.pcTime =
+            duration<double>(steady_clock::now() - trajectoryTelemetryStart)
+                .count();
+        if (!telemetryLog.is_open()) {
+          telemetryLog.open(telemetryFilePath, ios::out | ios::trunc);
+          if (!telemetryLog.is_open()) {
+            cerr << "[TELEMETRY FILE ERROR] " << telemetryFilePath << endl;
+            continue;
+          }
+          telemetryLog << "time,count1,count2,q1_actual,q2_actual\n";
+          telemetryLog.flush();
+        }
+        telemetryLog << fixed << setprecision(9) << telemetry.pcTime << ','
+                     << telemetry.count1 << ',' << telemetry.count2 << ','
+                     << telemetry.q1Actual << ',' << telemetry.q2Actual << '\n';
+        telemetryLog.flush();
+        ++telemetryPacketCount;
+      }
+      handleTelemetry(telemetry);
+    }
+  }
+}*/
+
+// ============================================================
+// REAL-TIME TELEMETRY LOGGER
+// ============================================================
+
+#include <fstream>
+
+const std::string TELEMETRY_FILE_PATH =
+    "E:\\CODE\\Arduino\\codecode\\telemetry.csv";
+
+std::ofstream telemetryFile;
+std::mutex telemetryFileMutex;
+
+bool telemetryFileOpen = false;
+bool telemetryReceivedAtLeastOnePacket = false;
+
+steady_clock::time_point telemetrySessionStart;
+
+// Number of VALID telemetry packets actually received from Mega
+uint64_t telemetryPacketCount = 0;
+
+struct EncoderTelemetry {
+  double pcTime;
+  int32_t count1;
+  int32_t count2;
+  double q1Actual;
+  double q2Actual;
+};
+
+// ============================================================
+// OPEN TELEMETRY FILE
+// ============================================================
+
+bool openTelemetryFile() {
+  lock_guard<mutex> lock(telemetryFileMutex);
+
+  if (telemetryFileOpen)
+    return true;
+
+  telemetryFile.open(TELEMETRY_FILE_PATH, ios::out | ios::trunc);
+
+  if (!telemetryFile.is_open()) {
+    cerr << "[TELEMETRY ERROR] Cannot open file: " << TELEMETRY_FILE_PATH
+         << endl;
+    return false;
+  }
+
+  telemetryFile << "time,count1,count2,q1_actual,q2_actual\n";
+
+  telemetryFile.flush();
+
+  telemetrySessionStart = steady_clock::now();
+
+  telemetryFileOpen = true;
+  telemetryReceivedAtLeastOnePacket = false;
+  telemetryPacketCount = 0;
+
+  cout << "[TELEMETRY] File opened: " << TELEMETRY_FILE_PATH << endl;
+
+  return true;
+}
+
+// ============================================================
+// RECORD ONE VALID TELEMETRY PACKET
+// ============================================================
+
+void recordTelemetrySample(int32_t count1, int32_t count2) {
+  lock_guard<mutex> lock(telemetryFileMutex);
+
+  // Open file ONLY when the first valid packet arrives.
+  if (!telemetryFileOpen) {
+
+    telemetryFile.open(TELEMETRY_FILE_PATH, ios::out | ios::trunc);
+
+    if (!telemetryFile.is_open()) {
+      cerr << "[TELEMETRY ERROR] Cannot open file: " << TELEMETRY_FILE_PATH
+           << endl;
+      return;
+    }
+
+    telemetryFile << "time,count1,count2,q1_actual,q2_actual\n";
+
+    telemetrySessionStart = steady_clock::now();
+
+    telemetryFileOpen = true;
+    telemetryReceivedAtLeastOnePacket = true;
+    telemetryPacketCount = 0;
+
+    cout << "[TELEMETRY] First valid packet received." << endl;
+    cout << "[TELEMETRY] Logging started." << endl;
+  }
+
+  // Timestamp is generated ONLY because a valid packet arrived.
+  double pcTime =
+      duration<double>(steady_clock::now() - telemetrySessionStart).count();
+
+  double q1Actual = static_cast<double>(count1) * 2.0 * PI / pwm_num1;
+
+  double q2Actual = static_cast<double>(count2) * 2.0 * PI / pwm_num2;
+
+  telemetryFile << fixed << setprecision(9) << pcTime << ',' << count1 << ','
+                << count2 << ',' << q1Actual << ',' << q2Actual << '\n';
+
+  // IMPORTANT:
+  // Force the row to disk immediately.
+  telemetryFile.flush();
+
+  ++telemetryPacketCount;
+
+  telemetryReceivedAtLeastOnePacket = true;
+}
+
+// ============================================================
+// CLOSE TELEMETRY FILE
+// ============================================================
+
+void closeTelemetryFile() {
+  lock_guard<mutex> lock(telemetryFileMutex);
+
+  if (telemetryFile.is_open()) {
+
+    telemetryFile.flush();
+    telemetryFile.close();
+
+    cout << "[TELEMETRY] File closed." << endl;
+    cout << "[TELEMETRY] Valid packets recorded = " << telemetryPacketCount
+         << endl;
+  }
+
+  telemetryFileOpen = false;
+}
+void solveInverseKinematics(point target) {
+  joint theta = {0.0f, 0.0f};
+
+  printf("Target point: (%d, %d, %d)\n", target.x, target.y, target.z);
+
+  if (indata.RRplanar_in(target, theta)) {
+    printf("IK solution found\n");
+    printf("theta1 = %.4f rad = %.1f deg\n", theta.theta1,
+           theta.theta1 * 180.0f / PI);
+    printf("theta2 = %.4f rad = %.1f deg\n", theta.theta2,
+           theta.theta2 * 180.0f / PI);
+  } else {
+    printf("Target point is out of robot workspace\n");
+  }
+}
+
+// ============================================================
+// COM Port Detection for Arduino Mega2560
+// ============================================================
+
+struct ComPortInfo {
+  string comPort;
+  string friendlyName;
+  string hardwareId;
+};
+
+vector<ComPortInfo> enumerateSerialPorts() {
+  vector<ComPortInfo> ports;
+
+  HMODULE setupApiModule = LoadLibraryA("setupapi.dll");
+  if (setupApiModule == nullptr) {
+    cout << "[SERIAL ERROR] Failed to load setupapi.dll" << endl;
+    return ports;
+  }
+
+  typedef HDEVINFO(WINAPI * PFN_SetupDiGetClassDevsA)(CONST GUID *, PCSTR, HWND,
+                                                      DWORD);
+  typedef BOOL(WINAPI * PFN_SetupDiEnumDeviceInfo)(HDEVINFO, DWORD,
+                                                   PSP_DEVINFO_DATA);
+  typedef BOOL(WINAPI * PFN_SetupDiGetDeviceRegistryPropertyA)(
+      HDEVINFO, PSP_DEVINFO_DATA, DWORD, PDWORD, PBYTE, DWORD, PDWORD);
+  typedef BOOL(WINAPI * PFN_SetupDiDestroyDeviceInfoList)(HDEVINFO);
+
+  PFN_SetupDiGetClassDevsA SetupDiGetClassDevsA_fn =
+      reinterpret_cast<PFN_SetupDiGetClassDevsA>(
+          GetProcAddress(setupApiModule, "SetupDiGetClassDevsA"));
+  PFN_SetupDiEnumDeviceInfo SetupDiEnumDeviceInfo_fn =
+      reinterpret_cast<PFN_SetupDiEnumDeviceInfo>(
+          GetProcAddress(setupApiModule, "SetupDiEnumDeviceInfo"));
+  PFN_SetupDiGetDeviceRegistryPropertyA SetupDiGetDeviceRegistryPropertyA_fn =
+      reinterpret_cast<PFN_SetupDiGetDeviceRegistryPropertyA>(
+          GetProcAddress(setupApiModule, "SetupDiGetDeviceRegistryPropertyA"));
+  PFN_SetupDiDestroyDeviceInfoList SetupDiDestroyDeviceInfoList_fn =
+      reinterpret_cast<PFN_SetupDiDestroyDeviceInfoList>(
+          GetProcAddress(setupApiModule, "SetupDiDestroyDeviceInfoList"));
+
+  if (SetupDiGetClassDevsA_fn == nullptr ||
+      SetupDiEnumDeviceInfo_fn == nullptr ||
+      SetupDiGetDeviceRegistryPropertyA_fn == nullptr ||
+      SetupDiDestroyDeviceInfoList_fn == nullptr) {
+    cout << "[SERIAL ERROR] SetupAPI entry points not found" << endl;
+    FreeLibrary(setupApiModule);
+    return ports;
+  }
+
+  const GUID guidDevClassPorts = {
+      0x4D36E978,
+      0xE325,
+      0x11CE,
+      {0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18}};
+
+  HDEVINFO deviceInfoSet = SetupDiGetClassDevsA_fn(&guidDevClassPorts, nullptr,
+                                                   nullptr, DIGCF_PRESENT);
+  if (deviceInfoSet == INVALID_HANDLE_VALUE) {
+    cout << "[SERIAL ERROR] SetupDiGetClassDevsA failed" << endl;
+    FreeLibrary(setupApiModule);
+    return ports;
+  }
+
+  SP_DEVINFO_DATA deviceInfoData = {};
+  deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+  for (DWORD index = 0;
+       SetupDiEnumDeviceInfo_fn(deviceInfoSet, index, &deviceInfoData);
+       ++index) {
+    char friendlyName[512] = {};
+    DWORD friendlyNameSize = sizeof(friendlyName);
+    DWORD friendlyType = 0;
+    BOOL gotFriendly = SetupDiGetDeviceRegistryPropertyA_fn(
+        deviceInfoSet, &deviceInfoData, SPDRP_FRIENDLYNAME, &friendlyType,
+        (PBYTE)friendlyName, friendlyNameSize, &friendlyNameSize);
+
+    char hardwareId[512] = {};
+    DWORD hardwareIdSize = sizeof(hardwareId);
+    DWORD hardwareType = 0;
+    BOOL gotHardware = SetupDiGetDeviceRegistryPropertyA_fn(
+        deviceInfoSet, &deviceInfoData, SPDRP_HARDWAREID, &hardwareType,
+        (PBYTE)hardwareId, hardwareIdSize, &hardwareIdSize);
+
+    if (gotFriendly) {
+      cout << "[SERIAL] Device: " << friendlyName << endl;
+    }
+    if (gotHardware) {
+      cout << "[SERIAL] HardwareID: " << hardwareId << endl;
+    }
+
+    string friendly = gotFriendly ? friendlyName : "";
+    string hardware = gotHardware ? hardwareId : "";
+
+    if (friendly.empty() && hardware.empty()) {
+      continue;
+    }
+
+    string comPort = "";
+    size_t comPos = friendly.find("COM");
+    if (comPos != string::npos) {
+      size_t start = comPos + 3;
+      size_t end = start;
+      while (end < friendly.size() &&
+             isdigit(static_cast<unsigned char>(friendly[end]))) {
+        ++end;
+      }
+      if (end > start) {
+        comPort = friendly.substr(comPos, end - comPos);
+      }
+    }
+
+    if (!comPort.empty()) {
+      ComPortInfo portInfo;
+      portInfo.comPort = comPort;
+      portInfo.friendlyName = friendly;
+      portInfo.hardwareId = hardware;
+      ports.push_back(portInfo);
+    }
+  }
+
+  SetupDiDestroyDeviceInfoList_fn(deviceInfoSet);
+  FreeLibrary(setupApiModule);
+  return ports;
+}
+
+bool isArduinoMega2560(const ComPortInfo &port) {
+  string friendly = port.friendlyName;
+  string hardware = port.hardwareId;
+
+  string friendlyUpper = friendly;
+  string hardwareUpper = hardware;
+  transform(friendlyUpper.begin(), friendlyUpper.end(), friendlyUpper.begin(),
+            ::toupper);
+  transform(hardwareUpper.begin(), hardwareUpper.end(), hardwareUpper.begin(),
+            ::toupper);
+
+  bool hasArduinoVid = hardwareUpper.find("VID_2341") != string::npos;
+  bool hasCh340 = hardwareUpper.find("VID_1A86") != string::npos &&
+                  hardwareUpper.find("PID_7523") != string::npos;
+  bool isCh340Friendly = friendlyUpper.find("USB-SERIAL CH340") != string::npos;
+
+  if (hasArduinoVid || hasCh340 || isCh340Friendly) {
+    return true;
+  }
+
+  return false;
+}
+
+string detectArduinoMega2560() {
+  cout << "[SERIAL] Searching for Arduino Mega2560..." << endl;
+
+  vector<ComPortInfo> ports = enumerateSerialPorts();
+  if (ports.empty()) {
+    cout << "[SERIAL ERROR] No serial ports detected" << endl;
+    return "";
+  }
+
+  cout << "[SERIAL] Available COM ports:" << endl;
+  for (size_t i = 0; i < ports.size(); ++i) {
+    if (!ports[i].comPort.empty()) {
+      cout << "  " << ports[i].comPort << endl;
+    }
+  }
+
+  vector<string> candidatePorts;
+  for (size_t i = 0; i < ports.size(); ++i) {
+    if (!ports[i].comPort.empty() && isArduinoMega2560(ports[i])) {
+      candidatePorts.push_back(ports[i].comPort);
+    }
+  }
+
+  if (candidatePorts.empty()) {
+    cout << "[SERIAL ERROR] Arduino Mega2560 not found." << endl;
+    return "";
+  }
+
+  if (candidatePorts.size() > 1) {
+    cout << "[SERIAL ERROR] Multiple Arduino devices found:" << endl;
+    for (size_t i = 0; i < candidatePorts.size(); ++i) {
+      cout << "  " << candidatePorts[i] << endl;
+    }
+    cout << "[SERIAL ERROR] Ambiguous device selection. Using first match."
+         << endl;
+  }
+
+  string selectedPort = candidatePorts[0];
+  cout << "[SERIAL] Arduino Mega2560 detected" << endl;
+  cout << "[SERIAL] Port = " << selectedPort << endl;
+  return selectedPort;
+}
+
+bool openSerialPort(const char *portName) {
+  serialHandle = CreateFileA(portName, GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                             OPEN_EXISTING, 0, nullptr);
+  if (serialHandle == INVALID_HANDLE_VALUE) {
+    cout << "[SERIAL ERROR]" << endl;
+    cout << "Failed to open " << portName << endl;
+    return false;
+  }
+
+  DCB dcb = {};
+  if (!GetCommState(serialHandle, &dcb)) {
+    cout << "[SERIAL ERROR] GetCommState failed" << endl;
+    CloseHandle(serialHandle);
+    serialHandle = INVALID_HANDLE_VALUE;
+    return false;
+  }
+
+  dcb.BaudRate = CBR_115200;
+  dcb.ByteSize = 8;
+  dcb.Parity = NOPARITY;
+  dcb.StopBits = ONESTOPBIT;
+
+  if (!SetCommState(serialHandle, &dcb)) {
+    cout << "[SERIAL ERROR] SetCommState failed" << endl;
+    CloseHandle(serialHandle);
+    serialHandle = INVALID_HANDLE_VALUE;
+    return false;
+  }
+
+  COMMTIMEOUTS timeouts = {};
+  timeouts.ReadIntervalTimeout = 1;
+  timeouts.ReadTotalTimeoutConstant = 1;
+  timeouts.ReadTotalTimeoutMultiplier = 1;
+  timeouts.WriteTotalTimeoutConstant = 10;
+  timeouts.WriteTotalTimeoutMultiplier = 10;
+  SetCommTimeouts(serialHandle, &timeouts);
+
+  cout << "[SERIAL] Opened " << portName << endl;
+  cout << "[SERIAL] Baud = 115200" << endl;
+  cout << "[SERIAL] Format = 8N1" << endl;
+  return true;
+}
+
+bool writeSerialPacket(double q1, double q2) {
+  if (serialHandle == INVALID_HANDLE_VALUE)
+    return false;
+
+  int16_t data1 = static_cast<int16_t>(round(q1 * 1000.0));
+  int16_t data2 = static_cast<int16_t>(round(q2 * 1000.0));
+
+  uint8_t payload[6] = {0xAA,
+                        0x55,
+                        static_cast<uint8_t>((data1 >> 8) & 0xFF),
+                        static_cast<uint8_t>(data1 & 0xFF),
+                        static_cast<uint8_t>((data2 >> 8) & 0xFF),
+                        static_cast<uint8_t>(data2 & 0xFF)};
+  uint8_t checksum = payload[2] + payload[3] + payload[4] + payload[5];
+  uint8_t frame[7] = {payload[0], payload[1], payload[2], payload[3],
+                      payload[4], payload[5], checksum};
+
+  // Print packet construction details
+  cout << "[TX PACKET]" << endl;
+  cout << "  q1 = " << q1 << endl;
+  cout << "  q2 = " << q2 << endl;
+  cout << "  data1 = " << data1 << endl;
+  cout << "  data2 = " << data2 << endl;
+  cout << "  frame = ";
+  for (int i = 0; i < 7; i++) {
+    printf("%02X", frame[i]);
+    if (i < 6)
+      cout << " ";
+  }
+  cout << endl;
+
+  lock_guard<mutex> lock(serialMutex);
+  DWORD written = 0;
+  BOOL result =
+      WriteFile(serialHandle, frame, sizeof(frame), &written, nullptr);
+
+  // Print transmission result
+  cout << "[TX RESULT]" << endl;
+  if (result && written == 7) {
+    cout << "  WriteFile = SUCCESS" << endl;
+    cout << "  written = 7/7" << endl;
+    cout << "  status = OK" << endl;
+    txPacketCount++;
+    cout << "[TX COUNT] packet = " << txPacketCount << endl;
+    return true;
+  } else {
+    cout << "  WriteFile = " << (result ? "TRUE" : "FALSE") << endl;
+    cout << "  written = " << written << "/7" << endl;
+    cout << "  expected = 7" << endl;
+    if (!result) {
+      cout << "  GetLastError = " << GetLastError() << endl;
+    }
+    return false;
+  }
+}
+
+void processInputLoop() {
+  while (true) {
+    string lineText;
+    cout << "\n[INPUT] > ";
+    if (!getline(cin, lineText))
+      continue;
+    if (lineText.empty())
+      continue;
+
+    char raw[128];
+    strncpy(raw, lineText.c_str(), sizeof(raw) - 1);
+    raw[sizeof(raw) - 1] = '\0';
+
+    Command localCmd;
+    if (!indata.parseCommand(raw, localCmd))
+      continue;
+
+    lock_guard<mutex> lock(programMutex);
+
+    switch (localCmd.type) {
+    case COUNT:
+      totalCommand = localCmd.count;
+      loadedCommand = 0;
+      executedCommand = 0;
+      loadingProgram = true;
+      runProgram = false;
+      trajectoryActive = false;
+      while (!indata.isEmpty()) {
+        Command discard;
+        indata.dequeueCmd(discard);
+      }
+      cout << "[CMD] COUNT = " << totalCommand << endl;
+      cout << "[PROGRAM] Program size: " << totalCommand << endl;
+      break;
+
+    case HOME:
+      currentQ1 = 0.0;
+      currentQ2 = PI;
+      runProgram = false;
+      loadingProgram = false;
+      trajectoryActive = false;
+      while (!indata.isEmpty()) {
+        Command discard;
+        indata.dequeueCmd(discard);
+      }
+      cout << "[CMD] HOME" << endl;
+      break;
+
+    case POINT_CMD:
+      if (loadingProgram) {
+        if (indata.enqueueCmd(localCmd)) {
+          loadedCommand++;
+          cout << "[LOAD] " << loadedCommand << "/" << totalCommand << endl;
+          if (loadedCommand >= totalCommand) {
+            loadingProgram = false;
+            runProgram = true;
+            cout << "[PROGRAM] Program Loaded" << endl;
+            cout << "[PROGRAM] Auto Run Start" << endl;
+          }
+        } else {
+          cout << "[QUEUE] Command queue is full" << endl;
+        }
+      } else {
+        if (indata.enqueueCmd(localCmd)) {
+          runProgram = true;
+          cout << "[PROGRAM] Direct point queued" << endl;
+        }
+      }
+      break;
+
+    default:
+      break;
+    }
+  }
+}
+
+void controlLoop() {
+  while (true) {
+    {
+      lock_guard<mutex> lock(programMutex);
+      if (!runProgram) {
+        this_thread::sleep_for(chrono::milliseconds(10));
+        continue;
+      }
+    }
+
+    if (!trajectoryActive) {
+      Command nextCmd;
+      bool gotOne = false;
+      {
+        lock_guard<mutex> lock(programMutex);
+        if (indata.dequeueCmd(nextCmd))
+          gotOne = true;
+      }
+
+      if (!gotOne) {
+        this_thread::sleep_for(chrono::milliseconds(10));
+        continue;
+      }
+
+      if (nextCmd.type != POINT_CMD) {
+        cout << "[CMD] Ignored non-point command" << endl;
+        continue;
+      }
+
+      targetPoint = nextCmd.p1;
+      cout << "[POINT] Target = (" << targetPoint.x << ", " << targetPoint.y
+           << ", " << targetPoint.z << ")" << endl;
+
+      joint ik = {0.0f, 0.0f};
+      if (!indata.RRplanar_in(targetPoint, ik)) {
+        cout << "[IK ERROR] Target point is unreachable" << endl;
+        continue;
+      }
+
+      startTheta = {static_cast<float>(currentQ1),
+                    static_cast<float>(currentQ2)};
+      targetTheta = ik;
+      cout << "[IK] theta1 = " << targetTheta.theta1
+           << " rad = " << targetTheta.theta1 * 180.0f / PI << " deg" << endl;
+      cout << "[IK] theta2 = " << targetTheta.theta2
+           << " rad = " << targetTheta.theta2 * 180.0f / PI << " deg" << endl;
+
+      double time1 = fabs(targetTheta.theta1 - startTheta.theta1) *
+                     TIME1_PER_90 / (PI / 2.0);
+      double time2 = fabs(targetTheta.theta2 - startTheta.theta2) *
+                     TIME2_PER_90 / (PI / 2.0);
+      trajectoryDuration = max(time1, time2);
+      cout << "[TRAJECTORY] duration = " << trajectoryDuration << " s" << endl;
+
+      trajectoryStart = steady_clock::now();
+      trajectoryActive = true;
+      trajectoryInterpolationCycles = 0;
+
+      // Print trajectory start message
+      cout << "[TRAJECTORY START]" << endl;
+      cout << "  startQ1 = " << setprecision(6) << startTheta.theta1 << endl;
+      cout << "  startQ2 = " << setprecision(6) << startTheta.theta2 << endl;
+      cout << "  targetQ1 = " << setprecision(6) << targetTheta.theta1 << endl;
+      cout << "  targetQ2 = " << setprecision(6) << targetTheta.theta2 << endl;
+      cout << "  duration = " << setprecision(4) << trajectoryDuration << endl;
+    }
+
+    if (trajectoryActive) {
+      auto now = steady_clock::now();
+      double elapsed = duration<double>(now - trajectoryStart).count();
+      double u = elapsed / max(trajectoryDuration, 1e-6);
+      if (u < 0.0)
+        u = 0.0;
+      if (u > 1.0)
+        u = 1.0;
+
+      double s = 10.0 * pow(u, 3) - 15.0 * pow(u, 4) + 6.0 * pow(u, 5);
+      double q1 =
+          startTheta.theta1 + (targetTheta.theta1 - startTheta.theta1) * s;
+      double q2 =
+          startTheta.theta2 + (targetTheta.theta2 - startTheta.theta2) * s;
+
+      // Print interpolation cycle data
+      trajectoryInterpolationCycles++;
+      cout << "[INTERP]" << endl;
+      cout << "  cycle = " << trajectoryInterpolationCycles << endl;
+      cout << "  t = " << fixed << setprecision(4) << elapsed << endl;
+      cout << "  u = " << setprecision(4) << u << endl;
+      cout << "  s = " << setprecision(6) << s << endl;
+      cout << "  q1 = " << setprecision(6) << q1 << endl;
+      cout << "  q2 = " << setprecision(6) << q2 << endl;
+
+      currentQ1 = q1;
+      currentQ2 = q2;
+      bool ok = writeSerialPacket(q1, q2);
+
+      if (elapsed >= trajectoryDuration) {
+        cout << "[TRAJECTORY END]" << endl;
+        cout << "  finalQ1 = " << setprecision(6) << currentQ1 << endl;
+        cout << "  finalQ2 = " << setprecision(6) << currentQ2 << endl;
+        cout << "  targetQ1 = " << setprecision(6) << targetTheta.theta1
+             << endl;
+        cout << "  targetQ2 = " << setprecision(6) << targetTheta.theta2
+             << endl;
+        cout << "  cycles = " << trajectoryInterpolationCycles << endl;
+        cout << "  packets = " << txPacketCount << endl;
+
+        cout << "[POINT DONE]" << endl;
+        currentQ1 = targetTheta.theta1;
+        currentQ2 = targetTheta.theta2;
+        trajectoryActive = false;
+        trajectoryInterpolationCycles = 0;
+
+        lock_guard<mutex> lock(programMutex);
+        executedCommand++;
+        cout << "[PROGRAM] executedCommand = " << executedCommand << "/"
+             << totalCommand << endl;
+
+        if (executedCommand >= totalCommand) {
+          runProgram = false;
+          loadingProgram = false;
+          cout << "[PROGRAM] FINISHED" << endl;
+        }
+      }
+    }
+
+    this_thread::sleep_for(chrono::milliseconds(10));
+  }
+}
+
+int main() {
+  startPoint = Point = {5, 0, 0};
+  currentQ1 = 0.0;
+  currentQ2 = PI;
+
+  encode1.setPID(3.8, 0.5, 8);
+  encode2.setPID(2, 0, 0.2);
+
+  cout << "[INFO] PC control node started" << endl;
+  cout << "[INFO] Use COUNT N then POINT_CMD x y z" << endl;
+  trajectoryTelemetryStart = steady_clock::now();
+
+  // Auto-detect Arduino Mega2560 COM port
+  string detectedPort = detectArduinoMega2560();
+
+  if (!detectedPort.empty()) {
+    // Convert COM port to Windows device path format
+    string devicePath = "\\\\.\\" + detectedPort;
+    if (!openSerialPort(devicePath.c_str())) {
+      cout << "[SERIAL] Port detected but failed to open. Print-only mode."
+           << endl;
+    }
+  } else {
+    cout << "[SERIAL] No Mega2560 detected. Print-only mode." << endl;
+  }
+
+  thread telemetryThread;
+  if (serialHandle != INVALID_HANDLE_VALUE) {
+    telemetryThread = thread(telemetryReceiveLoop);
+  }
+  thread inputThread(processInputLoop);
+  thread controlThread(controlLoop);
+
+  inputThread.join();
+  controlThread.join();
+  if (telemetryThread.joinable())
+    telemetryThread.join();
+  if (telemetryLog.is_open()) {
+    telemetryLog.flush();
+    telemetryLog.close();
+  }
+  return 0;
+}

@@ -1,0 +1,299 @@
+#include "Communication.h"
+#include "ESP32Config.h"
+#include "EncoderPCNT.h"
+#include "MotorControl.h"
+#include "RobotMath.h"
+#include <Arduino.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+
+QueueHandle_t telemetryQueue = nullptr;
+static PROCESSING motor1(MOTOR1_ENC_A, MOTOR1_ENC_B, IN_A0, IN_A1, PWM_A);
+static PROCESSING motor2(MOTOR2_ENC_A, MOTOR2_ENC_B, IN_B0, IN_B1, PWM_B);
+static volatile bool emergencyStop = false;
+static volatile bool communicationTimeout = true;
+static DesiredAngles desired = {0.0f, PI};
+static DesiredCounts desiredCounts = {0, 0, 0};
+static uint32_t lastCommandMs = 0;
+enum class MotionState {
+  IDLE,
+  DIRECT_JOINT,
+  HOMING,
+  POINT_MOTION,
+  LINE_MOTION,
+  CIRCLE_MOVE_TO_ENTRY,
+  CIRCLE_EXECUTE,
+  HOME_MOTOR1_SEEK,
+  HOME_MOTOR2_SEEK,
+  HOME_ERROR,
+  EMERGENCY_STOP,
+  COMMUNICATION_TIMEOUT
+};
+static MotionState motionState = MotionState::IDLE;
+static KINEMATICS kinematics;
+static point lineStart{}, lineEnd{}, circleTarget{};
+static joint startJoint{}, targetJoint{};
+static circle activeCircle{};
+static float entryAngle = 0.0f;
+static uint32_t motionTick = 0, motionTicks = 1, homingStartMs = 0;
+
+static joint current_joint() {
+  const float q1 = static_cast<float>(encoder1_count()) * 2.0f * PI / 11880.0f;
+  const float q2 = static_cast<float>(encoder2_count()) * 2.0f * PI / 1980.0f;
+  return {q1, q2};
+}
+static uint32_t duration_ticks(joint start, joint target) {
+  const float t1 =
+      std::fabs(target.theta1 - start.theta1) * TIME1_PER_90 / (PI / 2.0f);
+  const float t2 =
+      std::fabs(target.theta2 - start.theta2) * TIME2_PER_90 / (PI / 2.0f);
+  return static_cast<uint32_t>(
+      std::ceil(std::fmax(0.1f, std::fmax(t1, t2)) * 100.0f));
+}
+static void begin_command(const Command &command) {
+  if (command.type == CommandType::HOME) {
+    motor1.resetPID();
+    motor2.resetPID();
+    motors_stop();
+    homingStartMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+#if defined(HOME1_GPIO) && defined(HOME2_GPIO)
+    motionState = MotionState::HOME_MOTOR1_SEEK;
+#else
+    ESP_LOGE("ROBOT", "HOME requested without HOME1_GPIO and HOME2_GPIO");
+    motionState = MotionState::HOME_ERROR;
+#endif
+    motionTick = 0;
+    return;
+  }
+  startJoint = current_joint();
+  if (command.type == CommandType::POINT) {
+    point target{command.x1, command.y1, command.z1};
+    if (kinematics.RRplanar_in(target, targetJoint)) {
+      motionState = MotionState::POINT_MOTION;
+      motionTick = 0;
+      motionTicks = duration_ticks(startJoint, targetJoint);
+    }
+  } else if (command.type == CommandType::LINE) {
+    lineStart = {command.x1, command.y1, command.z1};
+    lineEnd = {command.x2, command.y2, command.z2};
+    joint lineStartJoint{}, lineEndJoint{};
+    if (kinematics.RRplanar_in(lineStart, lineStartJoint) &&
+        kinematics.RRplanar_in(lineEnd, lineEndJoint) &&
+        kinematics.checkLine2R(lineStart, lineEnd, lineStartJoint,
+                               lineEndJoint)) {
+      targetJoint = lineEndJoint;
+      motionState = MotionState::LINE_MOTION;
+      motionTick = 0;
+      motionTicks = duration_ticks(startJoint, lineStartJoint) +
+                    duration_ticks(lineStartJoint, lineEndJoint);
+    }
+  } else if (command.type == CommandType::CIRCLE) {
+    activeCircle = {{command.x1, command.y1, command.z1}, command.radius};
+    if (kinematics.checkCircle2R(activeCircle)) {
+      const point actual = kinematics.forwardKinematics(startJoint);
+      point entry = kinematics.projectionCircle(activeCircle, actual);
+      joint entryJoint{};
+      if (kinematics.RRplanar_in(entry, entryJoint)) {
+        const float dx = static_cast<float>(actual.x - entry.x);
+        const float dy = static_cast<float>(actual.y - entry.y);
+        entryAngle =
+            std::atan2(entry.y - activeCircle.p.y, entry.x - activeCircle.p.x);
+        targetJoint = entryJoint;
+        motionTick = 0;
+        if (dx * dx + dy * dy <= 1.0f) {
+          desired.q1 = entryJoint.theta1;
+          desired.q2 = entryJoint.theta2;
+          motionTicks = 500;
+          motionState = MotionState::CIRCLE_EXECUTE;
+        } else {
+          motionTicks = duration_ticks(startJoint, targetJoint);
+          motionState = MotionState::CIRCLE_MOVE_TO_ENTRY;
+        }
+      }
+    }
+  }
+  motor1.resetPID();
+  motor2.resetPID();
+}
+static void update_motion() {
+  const float u = std::fmin(1.0f, static_cast<float>(motionTick) / motionTicks);
+  const float s = motor1.interQuintic(u);
+  if (motionState == MotionState::POINT_MOTION) {
+    desired.q1 = motor1.movePoint(startJoint.theta1, targetJoint.theta1, s);
+    desired.q2 = motor2.movePoint(startJoint.theta2, targetJoint.theta2, s);
+  } else if (motionState == MotionState::LINE_MOTION) {
+    point p{};
+    kinematics.moveLine(lineStart, lineEnd, p, s);
+    joint solved =
+        desired.q1 == desired.q1 ? joint{desired.q1, desired.q2} : startJoint;
+    if (kinematics.RRplanar_in(p, solved)) {
+      desired.q1 = solved.theta1;
+      desired.q2 = solved.theta2;
+    } else {
+      motionState = MotionState::IDLE;
+      motors_stop();
+      return;
+    }
+  } else if (motionState == MotionState::CIRCLE_MOVE_TO_ENTRY) {
+    desired.q1 = motor1.movePoint(startJoint.theta1, targetJoint.theta1, s);
+    desired.q2 = motor2.movePoint(startJoint.theta2, targetJoint.theta2, s);
+    if (motionTick++ >= motionTicks) {
+      motionTick = 0;
+      motionTicks = 500;
+      motionState = MotionState::CIRCLE_EXECUTE;
+    }
+    return;
+  } else if (motionState == MotionState::CIRCLE_EXECUTE) {
+    point p{};
+    const float angle = entryAngle + CIRCLE_DIRECTION * 2.0f * PI * s;
+    p = {static_cast<int>(std::lround(activeCircle.p.x +
+                                      activeCircle.radius * std::cos(angle))),
+         static_cast<int>(std::lround(activeCircle.p.y +
+                                      activeCircle.radius * std::sin(angle))),
+         activeCircle.p.z};
+    joint solved{desired.q1, desired.q2};
+    if (kinematics.RRplanar_in(p, solved)) {
+      desired.q1 = solved.theta1;
+      desired.q2 = solved.theta2;
+    } else {
+      motionState = MotionState::IDLE;
+      motors_stop();
+      return;
+    }
+  }
+  if (motionTick++ >= motionTicks) {
+    motionState = MotionState::IDLE;
+    motor1.resetPID();
+    motor2.resetPID();
+  }
+}
+
+static bool home_active(gpio_num_t pin) { return gpio_get_level(pin) == 0; }
+static void update_homing(uint32_t nowMs) {
+  if (nowMs - homingStartMs > HOMING_TIMEOUT_MS) {
+    motors_stop();
+    motor1.resetPID();
+    motor2.resetPID();
+    ESP_LOGE("ROBOT", "Homing timeout");
+    motionState = MotionState::HOME_ERROR;
+    return;
+  }
+#if defined(HOME1_GPIO) && defined(HOME2_GPIO)
+  if (motionState == MotionState::HOME_MOTOR1_SEEK) {
+    motor2_running(0);
+    if (home_active(static_cast<gpio_num_t>(HOME1_GPIO))) {
+      motor1_running(0);
+      encoder1_reset(0);
+      motor1.resetPID();
+      motionState = MotionState::HOME_MOTOR2_SEEK;
+    } else
+      motor1_running(-HOMING_PWM);
+  } else if (motionState == MotionState::HOME_MOTOR2_SEEK) {
+    motor1_running(0);
+    if (home_active(static_cast<gpio_num_t>(HOME2_GPIO))) {
+      motor2_running(0);
+      encoder2_reset(1980 / 2);
+      motor2.resetPID();
+      desired = {HOME1_ANGLE, HOME2_ANGLE, nowMs};
+      desiredCounts = {0, 990, nowMs};
+      motionState = MotionState::IDLE;
+    } else
+      motor2_running(-HOMING_PWM);
+  }
+#endif
+}
+
+static void control_task(void *) {
+  controlTaskHandle = xTaskGetCurrentTaskHandle();
+  motor1.setPID(3.8f, 0.5f, 8.0f);
+  motor2.setPID(2.0f, 0.0f, 0.2f);
+  encoder1_reset(0);
+  encoder2_reset(1980 / 2);
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    DesiredCounts command{};
+    while (xQueueReceive(cmdQueue, &command, 0) == pdTRUE) {
+      lastCommandMs = command.receivedAtMs;
+      if (motionState == MotionState::IDLE ||
+          motionState == MotionState::DIRECT_JOINT) {
+        desiredCounts = command;
+        desired.q1 = static_cast<float>(command.count1) * 2.0f * PI / 11880.0f;
+        desired.q2 = static_cast<float>(command.count2) * 2.0f * PI / 1980.0f;
+        motionState = MotionState::DIRECT_JOINT;
+      }
+    }
+    Command highLevel{};
+    if ((motionState == MotionState::IDLE ||
+         motionState == MotionState::DIRECT_JOINT) &&
+        xQueueReceive(highLevelCommandQueue, &highLevel, 0) == pdTRUE) {
+      lastCommandMs = highLevel.receivedAtMs;
+      begin_command(highLevel);
+    }
+    const uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    communicationTimeout =
+        (lastCommandMs == 0) || (nowMs - lastCommandMs > SERIAL_TIMEOUT_MS);
+    const int32_t count1 = encoder1_count();
+    const int32_t count2 = encoder2_count();
+    EncoderCounts telemetry = {count1, count2};
+    xQueueSend(telemetryQueue, &telemetry, 0);
+
+#if defined(STOP_GPIO)
+    if (gpio_get_level(static_cast<gpio_num_t>(STOP_GPIO)) == 0)
+      emergencyStop = true;
+#endif
+    if (emergencyStop) {
+      motors_stop();
+      motor1.resetPID();
+      motor2.resetPID();
+      motionState = MotionState::EMERGENCY_STOP;
+      continue;
+    }
+    if (motionState == MotionState::HOME_MOTOR1_SEEK ||
+        motionState == MotionState::HOME_MOTOR2_SEEK) {
+      update_homing(nowMs);
+      continue;
+    }
+    if (communicationTimeout || motionState == MotionState::HOME_ERROR ||
+        motionState == MotionState::EMERGENCY_STOP) {
+      motors_stop();
+      motor1.resetPID();
+      motor2.resetPID();
+      if (communicationTimeout)
+        motionState = MotionState::COMMUNICATION_TIMEOUT;
+      continue;
+    }
+    if (motionState == MotionState::POINT_MOTION ||
+        motionState == MotionState::LINE_MOTION ||
+        motionState == MotionState::CIRCLE_MOVE_TO_ENTRY ||
+        motionState == MotionState::CIRCLE_EXECUTE)
+      update_motion();
+    const float error1 =
+        static_cast<float>(desiredCounts.count1) - static_cast<float>(count1);
+    const float error2 =
+        static_cast<float>(desiredCounts.count2) - static_cast<float>(count2);
+    motor1_running(motor1.PIDcalc(error1, CONTROL_DT));
+    motor2_running(motor2.PIDcalc(error2, CONTROL_DT));
+  }
+}
+
+void setup() {
+  gpio_configuration();
+  pwm_configuration();
+  adc_configuration();
+  uart_configuration();
+  i2c_configuration();
+  pcnt_configuration();
+  timer_configuration();
+  cmdQueue = xQueueCreate(CMD_QUEUE_SIZE, sizeof(DesiredCounts));
+  bufferQueue = xQueueCreate(BUFFER_QUEUE_SIZE, sizeof(uint8_t));
+  telemetryQueue = xQueueCreate(BUFFER_QUEUE_SIZE, sizeof(EncoderCounts));
+  highLevelCommandQueue = xQueueCreate(CMD_QUEUE_SIZE, sizeof(Command));
+  configASSERT(cmdQueue != nullptr && telemetryQueue != nullptr);
+  xTaskCreatePinnedToCore(control_task, "control_task", 8192, nullptr,
+                          configMAX_PRIORITIES - 2, nullptr, 1);
+  xTaskCreatePinnedToCore(communication_task, "uart_task", 4096, nullptr, 2,
+                          nullptr, 0);
+  start_control_timer();
+}
+
+void loop() { vTaskDelay(portMAX_DELAY); }

@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "HMI (F5)",
+            "type": "coreclr",
+            "request": "launch",
+            "program": "${workspaceFolder}/HMI/bin/x64/Debug/net8.0-windows/HMI.exe",
+            "cwd": "${workspaceFolder}/HMI",
+            "preLaunchTask": "F5: Build + Upload ESP32, Build HMI",
+            "stopAtEntry": false,
+            "justMyCode": true
+        }
+    ]
+}

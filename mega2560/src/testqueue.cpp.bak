@@ -1,0 +1,452 @@
+#include <MControl.h>
+
+#define HOME1 15
+#define HOME2 16
+#define STOP 17
+
+#define PINA 18
+#define PINB 19
+#define PINC 20
+#define PIND 21
+
+#define pwm_num1 11880
+#define pwm_num2 937.2
+
+#define LEFT_CONSTRAINT_MOTOR1 130 * PI / 180
+#define RIGHT_CONSTRAINT_MOTOR1 50 * PI / 180
+#define LEFT_CONSTRAINT_MOTOR2 140 * PI / 180
+#define RIGHT_CONSTRAINT_MOTOR2 -140 * PI / 180
+
+Command currentCmd;
+
+AF_DCMotor motor1(1), motor2(2);
+
+INPUT_DATA indata;
+PROCESSING encode1(PINA, PINB), encode2(PINC, PIND);
+KINEMATICS encode;
+
+MOVE_MODE Mode = NORMAL;
+
+point Point = {0}, startPoint = {0}, targetPoint = {0}, center = {0};
+joint Theta = {0}, startTheta = {0}, targetTheta = {0};
+
+point vectorPoint0 = 0.3 * point{targetPoint.x - startPoint.x,
+                                 targetPoint.y - startPoint.y,
+                                 targetPoint.z - startPoint.z},
+      vectorPoint1 = 0.7 * point{targetPoint.x - startPoint.x,
+                                 targetPoint.y - startPoint.y,
+                                 targetPoint.z - startPoint.z};
+
+joint vectorTheta0 = {0.3f * (targetTheta.theta1 - startTheta.theta1),
+                      0.3f * (targetTheta.theta2 - startTheta.theta2)},
+      vectorTheta1 = {0.7f * (targetTheta.theta1 - startTheta.theta1),
+                      0.7f * (targetTheta.theta2 - startTheta.theta2)};
+
+float link_length[] = {20, 15};
+
+float error1 = 0, error2 = 0, speed1 = 0, speed2 = 0, timeStart1 = 0,
+      timeStart2 = 0, timming1 = 0, timming2 = 0, timeSum1 = 0, timeSum2 = 0;
+
+boolean checkData = false, isHoming1 = false, isHoming2 = false,
+        isMoving = false, isStop = false, isStartPoint1 = false,
+        isStartPoint2 = false;
+
+boolean *newData = &checkData;
+
+byte buffer[20];
+byte length = 0;
+char line[50];
+
+byte cmdBuffer[20];
+byte cmdLength = 0;
+bool hasCmd = false;
+
+void ISR1() { encode1.count(); }
+void ISR2() { encode2.count(); }
+
+void runMotor1() {
+  if (buffer[0] == (byte)POINT) {
+    timming1 = encode1.interQuintic(timeStart1, timeSum1);
+    Theta.theta1 =
+        encode1.movePoint(startTheta.theta1, targetTheta.theta1, timming1);
+  }
+
+  else if (buffer[0] == (byte)LINE) {
+    if (isStartPoint1 == true) {
+      // move to the start point of the line
+      timming1 = encode1.interQuintic(timeStart1, timeSum1);
+      Theta.theta1 =
+          encode1.movePoint(Theta.theta1, startTheta.theta1, timming1);
+
+      if (round(Theta.theta1) - round(startTheta.theta1) <= 5 &&
+          round(Theta.theta2) - round(startTheta.theta2) <= 5) {
+        timeStart1 = millis();
+        isStartPoint1 = false;
+      }
+    } else {
+      timming1 = encode1.interQuintic(timeStart1, timeSum1);
+      encode1.moveLine(startPoint, targetPoint, Point, timming1);
+    }
+  }
+  error1 = Theta.theta1 * pwm_num1 / (2 * PI) - encode1.count_enc;
+  Serial.println(String(error1) + "   " + String(encode1.getstate(), BIN) +
+                 "  -  " + String(encode1.count_enc) + "  /  " +
+                 String(millis() / 1000));
+  speed1 = encode1.PIDcalc(error1);
+  encode1.running(motor1, speed1);
+}
+
+void runMotor2() {
+  if (buffer[0] == (byte)POINT) {
+    timming2 = encode2.interQuintic(timeStart2, timeSum2);
+    Theta.theta2 =
+        encode2.movePoint(startTheta.theta2, targetTheta.theta2, timming2);
+
+  } else if (buffer[0] == (byte)LINE) {
+    if (isStartPoint2 == true) {
+      // move to the start point of the line
+      timming2 = encode2.interQuintic(timeStart2, timeSum2);
+      Theta.theta2 =
+          encode2.movePoint(Theta.theta2, startTheta.theta2, timming2);
+
+      if (round(Theta.theta1) - round(startTheta.theta1) <= 5 &&
+          round(Theta.theta2) - round(startTheta.theta2) <= 5) {
+        timeStart2 = millis();
+        isStartPoint2 = false;
+      }
+    } else {
+      timming2 = encode2.interQuintic(timeStart2, timeSum2);
+      encode2.moveLine(startPoint, targetPoint, Point, timming2);
+    }
+  }
+  error2 = Theta.theta2 * pwm_num2 / (2 * PI) - encode2.count_enc;
+  Serial.println(String(error2) + "   " + String(encode2.getstate(), BIN) +
+                 "  -  " + String(encode2.count_enc) + "  /  " +
+                 String(millis() / 1000));
+  speed2 = encode2.PIDcalc(error2);
+  encode2.running(motor2, speed2);
+}
+
+void runMotor1_2() {
+  runMotor1();
+  runMotor2();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PINA, INPUT_PULLUP);
+  pinMode(PINB, INPUT_PULLUP);
+  pinMode(PINC, INPUT_PULLUP);
+  pinMode(PIND, INPUT_PULLUP);
+
+  pinMode(HOME1, INPUT_PULLUP);
+  pinMode(HOME2, INPUT_PULLUP);
+  pinMode(STOP, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(PINA), ISR1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PINB), ISR1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PINC), ISR2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIND), ISR2, CHANGE);
+
+  // Theta.theta1 = encode1.count_enc;
+  // Theta.theta2 = encode2.count_enc;
+
+  startPoint.x = Point.x = 5;
+  startPoint.y = Point.y = 0;
+  startPoint.z = Point.z = 0;
+
+  Theta.theta1 = 0;
+  Theta.theta2 = PI;
+
+  encode1.count_enc = 0;
+  encode2.count_enc = pwm_num2 / 2;
+
+  encode1.setPID(3, 0.5, 10); // 3.5  0.5  10
+  encode2.setPID(3, 1, 5);
+
+  motor1.setSpeed(0);
+  motor1.run(FORWARD);
+  motor2.setSpeed(0);
+  motor2.run(FORWARD);
+
+  Serial.println("System ready, input the number: ");
+}
+
+void loop() {
+  // indata.scan (line, buffer, &length, newData);
+  // indata.parseData (recvChars, buffer, &length, &newData);
+  indata.recvByte(line, buffer, newData);
+
+  if (*newData) {
+    // Enqueue the received buffer for processing
+    if (!indata.enqueueBuffer(buffer, length)) {
+      Serial.println("[ERR] Queue FULL - Command discarded");
+    } else {
+      Serial.println("[INFO] Command enqueued");
+    }
+    *newData = false;
+  }
+
+  // Process queued commands when not moving
+  if (!indata.isEmpty() && !isMoving) {
+    if (indata.dequeueBuffer(buffer, length)) {
+      Serial.println("[INFO] Processing queued command");
+
+      if (digitalRead(STOP) == LOW) {
+        Serial.println(">>  EMERGENCY STOP  <<");
+        isStop = true;
+        isMoving = false;
+        isHoming1 = isHoming2 = false;
+      } else if (buffer[0] == (byte)HOME) {
+        isStop = false;
+        isMoving = false;
+        isHoming1 = isHoming2 = true;
+      } else if (buffer[0] == POINT || buffer[0] == LINE) {
+        isStop = false;
+        isHoming1 = isHoming2 = false;
+
+        if (buffer[0] == POINT) {
+          startTheta = Theta;
+          startPoint = Point;
+
+          indata.convertbyte2coor(targetPoint, buffer, 1);
+
+          if (encode.RRplanar_in(targetPoint, link_length, targetTheta)) {
+            isMoving = true;
+
+            if (startTheta.theta1 >= 130 * PI / 180 &&
+                    startTheta.theta2 >= 150 * PI / 180 ||
+                startTheta.theta1 <= 50 * PI / 180 &&
+                    startTheta.theta2 <= -150 * PI / 180) {
+
+              Mode = THETA1_FIRST;
+              timeStart1 = millis();
+            } else if (targetTheta.theta1 <= 50 * PI / 180 &&
+                           targetTheta.theta2 <= -150 * PI / 180 ||
+                       targetTheta.theta1 >= 130 * PI / 180 &&
+                           targetTheta.theta2 >= 150 * PI / 180) {
+
+              Mode = THETA2_FIRST;
+              timeStart2 = millis();
+            } else {
+              Mode = NORMAL;
+              timeStart1 = timeStart2 = millis();
+            }
+
+            Serial.println("Point is reachable");
+            Serial.print("Theta 0 = ");
+            Serial.println((int)round(targetTheta.theta1 * 180 / PI));
+            Serial.print("Theta 1 = ");
+            Serial.println((int)round(targetTheta.theta2 * 180 / PI));
+            Serial.println();
+          } else {
+            Serial.println("Out of workspace");
+            Serial.println();
+            return;
+          }
+        }
+
+        else if (buffer[0] == LINE) {
+          indata.convertbyte2coor(startPoint, buffer, 1);
+          indata.convertbyte2coor(targetPoint, buffer, 7);
+
+          if (encode.RRplanar_in(startPoint, link_length, startTheta) &&
+              encode.RRplanar_in(targetPoint, link_length, targetTheta) &&
+              encode.checkLine2R(startPoint, targetPoint, link_length,
+                                 startTheta, targetTheta)) {
+
+            isMoving = true;
+            if (Point.x == startPoint.x && Point.y == startPoint.y) {
+              isStartPoint1 = true;
+              isStartPoint2 = true;
+            } else {
+              isStartPoint1 = false;
+              isStartPoint2 = false;
+            }
+
+            if (startTheta.theta1 >= LEFT_CONSTRAINT_MOTOR1 &&
+                    startTheta.theta2 >= LEFT_CONSTRAINT_MOTOR2 ||
+                startTheta.theta1 <= RIGHT_CONSTRAINT_MOTOR1 &&
+                    startTheta.theta2 <= RIGHT_CONSTRAINT_MOTOR2) {
+
+              Mode = THETA1_FIRST;
+
+            } else if (targetTheta.theta1 <= RIGHT_CONSTRAINT_MOTOR1 &&
+                           targetTheta.theta2 <= RIGHT_CONSTRAINT_MOTOR2 ||
+                       targetTheta.theta1 >= LEFT_CONSTRAINT_MOTOR1 &&
+                           targetTheta.theta2 >= LEFT_CONSTRAINT_MOTOR2) {
+
+              Mode = THETA2_FIRST;
+
+            } else {
+              Mode = NORMAL;
+            }
+
+            Serial.println("THE LINE IS VALID");
+            Serial.println("The starting point begins at: ");
+            Serial.print("Theta 0 = ");
+            Serial.println((int)round(startTheta.theta1 * 180 / PI));
+            Serial.print("Theta 1 = ");
+            Serial.println((int)round(startTheta.theta2 * 180 / PI));
+
+            Serial.println("The end point ends at: ");
+            Serial.print("Theta 0 = ");
+            Serial.println((int)round(targetTheta.theta1 * 180 / PI));
+            Serial.print("Theta 1 = ");
+            Serial.println((int)round(targetTheta.theta2 * 180 / PI));
+          } else {
+            Serial.println("Out of workspace");
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  if (isStop) {
+    motor1.run(BRAKE);
+    motor1.setSpeed(0);
+    motor2.run(BRAKE);
+    motor2.setSpeed(0);
+    return;
+  }
+
+  if (isHoming1 || isHoming2) {
+    if (isHoming1) {
+      motor1.run(BACKWARD);
+      motor1.setSpeed(80);
+      // encode1.homing(motor1, HOME1, HIGH, &isHoming1);
+      if (digitalRead(HOME1) == HIGH) {
+        encode1.count_enc = 0;
+        motor1.run(RELEASE);
+        motor1.setSpeed(0);
+        Serial.println("HOMING_1 IS DONE");
+        isHoming1 = false;
+        return;
+      }
+    }
+    /*if (isHoming2) {
+      encode2.count_enc = pwm_num2 / 2;
+      //encode2.homing(motor2, HOME2, HIGH, &isHoming2);
+      if (digitalRead(HOME2) == HIGH) {
+        motor2.run(RELEASE);
+        motor2.setSpeed(0);
+        // count_enc = 0;
+        Serial.println("HOMING_2 IS DONE");
+        isHoming2 = false;
+        return;
+      }
+
+      motor2.run(FORWARD);
+      motor2.setSpeed(60);
+    }*/
+    return;
+  }
+
+  if (isMoving) {
+    // assume 1.8 and 4.0 seconds for PI/2 pulse
+    timeSum1 = fabs(targetTheta.theta1 - startTheta.theta1) * 1.8 / (PI / 2);
+    timeSum2 = fabs(targetTheta.theta2 - startTheta.theta2) * 4 / (PI / 2);
+
+    if (Mode == THETA1_FIRST) {
+      runMotor1();
+      if (round(Theta.theta1) == round(LEFT_CONSTRAINT_MOTOR1) ||
+          round(Theta.theta1) == round(RIGHT_CONSTRAINT_MOTOR1)) {
+        timeStart2 = millis();
+        runMotor2();
+      }
+      return;
+    }
+
+    else if (Mode == THETA2_FIRST) {
+      runMotor2();
+      if (round(Theta.theta2) == round(LEFT_CONSTRAINT_MOTOR2) ||
+          round(Theta.theta2) == round(RIGHT_CONSTRAINT_MOTOR2)) {
+        timeStart1 = millis();
+        runMotor1();
+      }
+      return;
+    } else if (Mode == NORMAL) {
+      runMotor1_2();
+      return;
+    }
+  }
+
+  /*if (isMoving) {
+    // assume 1.8 and 4.0 seconds for PI/2 pulse
+    timeSum1 = fabs(targetTheta.theta1 - startTheta.theta1) * 1.8 / (PI / 2);
+    timeSum2 = fabs(targetTheta.theta2 - startTheta.theta2) * 4 / (PI / 2);
+
+    if (Mode == THETA1_FIRST) {
+
+      // if (buffer [0] == (byte) POINT) {
+      runMotor1();
+      if (roundf(Theta.theta1) == roundf(LEFT_CONSTRAINT_MOTOR1) ||
+          roundf(Theta.theta1) == roundf(RIGHT_CONSTRAINT_MOTOR1))
+        timeStart2 = millis();
+      if (Theta.theta1 <= LEFT_CONSTRAINT_MOTOR1 ||
+          Theta.theta1 >= RIGHT_CONSTRAINT_MOTOR1)
+        runMotor2();
+      return;
+      //}
+
+      // else if (buffer [0] == (byte) LINE) {}
+    }
+
+    else if (Mode == THETA2_FIRST) {
+
+      // if (buffer [0] == (byte) POINT) {
+      runMotor2();
+      if (roundf(Theta.theta2) == roundf(LEFT_CONSTRAINT_MOTOR2) ||
+          roundf(Theta.theta2) == roundf(RIGHT_CONSTRAINT_MOTOR2))
+        timeStart1 = millis();
+      if (Theta.theta2 >= LEFT_CONSTRAINT_MOTOR2 ||
+          Theta.theta2 <= RIGHT_CONSTRAINT_MOTOR2)
+        runMotor1();
+      return;
+      //}
+
+      // else if (buffer [0] == (byte) LINE) {
+      runMotor1();
+      if (roundf(Theta.theta1) == roundf(LEFT_CONSTRAINT_MOTOR1) ||
+          roundf(Theta.theta1) == roundf(RIGHT_CONSTRAINT_MOTOR1))
+        timeStart2 = millis();
+      //}
+    }
+
+    else if (Mode == NORMAL) {
+
+      // if (buffer [0] == (byte) POINT) {
+      runMotor1_2();
+      return;
+      //}
+
+      // else if (buffer [0] == LINE) {}
+
+      // else if (buffer [0] == CIRCLE) {}
+    }*/
+
+  // encode1.splineTheta (startTheta, targetTheta, vectorTheta0, vectorTheta1,
+  // Theta, timming1); encode2.splineTheta (startTheta, targetTheta,
+  // vectorTheta0, vectorTheta1, Theta, timming2);
+
+  // encode1.splineTheta (startTheta, targetTheta, vectorTheta0, vectorTheta1,
+  // Theta, timming1); encode2.splineTheta (startTheta, targetTheta,
+  // vectorTheta0, vectorTheta1, Theta, timming2);
+
+  // Serial.print (error1); Serial.print (" / "); Serial.println (error2);
+
+  // if (speed != 0) Serial.println (speed);
+
+  /*if (encode1.count_enc != 0) {
+    Serial.print (encode1.getstate(), BIN);
+    Serial.print (" - ");
+    Serial.print (encode1.count_enc);
+    Serial.print (" / ");
+    Serial.println (millis()/1000);
+    encode2.count_enc = 0;
+    delay (60000);
+  }
+  */
+  //}
+}

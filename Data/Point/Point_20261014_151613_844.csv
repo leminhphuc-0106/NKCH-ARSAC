@@ -1,0 +1,1 @@
+time,Count1,Count2,Theta1Rad,Theta2Rad,XMetres,YMetres,TargetTheta1Rad,TargetTheta2Rad,Error1Rad,Error2Rad,TotalErrorRad,RefVel1_Rads,RefVel2_Rads,RefAcc1_Rads2,RefAcc2_Rads2,TauDyn1_Nm,TauDyn2_Nm,TauPID1_Nm,TauPID2_Nm,TauCmd1_Nm,TauCmd2_Nm,Pwm1,Pwm2

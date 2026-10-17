@@ -1,0 +1,24 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../mega2560"
+		},
+		{
+			"path": "../../uno"
+		},
+		{
+			"path": "../../../../Academic/7th SEMESTER/CTDL/Practice"
+		}
+	],
+	"settings": {
+		"powershell.cwd": "codecode",
+		"dotnet.preferCSharpExtension": true
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": []
+	}
+}
