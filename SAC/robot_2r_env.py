@@ -607,23 +607,18 @@ class Robot2REnv(gym.Env):
             )
 
         observation = self._get_observation()
-
         reward = self._get_reward(action)
-
         position_error = (
             self.target_q - self.q
         )
-
         terminated = bool(
             np.linalg.norm(position_error)
             < 0.03
         )
-
         truncated = bool(
             self.step_count
             >= self.max_steps
         )
-
         info = {
             "q": self.q.copy(),
             "dq": self.dq.copy(),
@@ -632,7 +627,6 @@ class Robot2REnv(gym.Env):
             "action": action.copy(),
             "invalid_state": False,
         }
-
         return (
             observation,
             reward,
@@ -640,7 +634,6 @@ class Robot2REnv(gym.Env):
             truncated,
             info,
         )
-
     def close(self):
         pass
 
@@ -650,34 +643,27 @@ if __name__ == "__main__":
         randomize_parameters=True,
         measurement_noise_std=0.001,
     )
-
     observation, info = env.reset(
         seed=42
     )
-
     print(
         "Observation shape:",
         observation.shape,
     )
-
     print(
         "Initial observation:",
         observation,
     )
-
     print(
         "Action space:",
         env.action_space,
     )
-
     print(
         "Observation space:",
         env.observation_space,
     )
-
     for index in range(100):
         action = env.action_space.sample()
-
         (
             observation,
             reward,
@@ -685,7 +671,6 @@ if __name__ == "__main__":
             truncated,
             info,
         ) = env.step(action)
-
         if not np.all(
             np.isfinite(observation)
         ):
@@ -699,5 +684,4 @@ if __name__ == "__main__":
     print(
         "Environment smoke test completed."
     )
-
     env.close()

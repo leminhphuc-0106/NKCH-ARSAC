@@ -15,19 +15,14 @@ from robot_2r_env import Robot2REnv
 class AdaptivePID2REnv(gym.Env):
     """
     Môi trường SAC điều chỉnh hệ số PID cho robot 2R.
-
     SAC:
         Chọn Kp, Ki, Kd.
-
     PID:
         Tính torque điều khiển.
-
     Robot2REnv:
         Nhận torque PID và mô phỏng động lực học robot.
-
     SAC KHÔNG trực tiếp tạo torque.
     """
-
     metadata = {"render_modes": []}
 
     def __init__(self):
@@ -45,28 +40,22 @@ class AdaptivePID2REnv(gym.Env):
 
         self.dt = float(self.robot_env.dt)
         self.torque_limit = float(self.robot_env.torque_limit)
-
         # 2. Cấu hình thời gian cập nhật hệ số PID
         self.gain_update_period = 0.05
         self.gain_update_steps = max(
             1,
             int(round(self.gain_update_period / self.dt)),
         )
-
         self.step_counter = 0
-
         # =========================================================
         # 3. Giới hạn hệ số PID
-        #
         # Mỗi khớp có:
         #     Kp
         #     Ki
         #     Kd
-        #
         # Tổng cộng:
         #     6 giá trị
         # =========================================================
-
         self.kp_min = np.array(
             [0.0, 0.0],
             dtype=np.float32,
@@ -166,10 +155,8 @@ class AdaptivePID2REnv(gym.Env):
         # 7. Xác định action space
         #
         # SAC tạo ra 6 giá trị trong khoảng [-1, 1].
-        #
         # Action:
         #     [Kp1, Ki1, Kd1, Kp2, Ki2, Kd2]
-        #
         # Các giá trị này sẽ được chuyển thành hệ số PID
         # thực tế theo giới hạn đã khai báo ở trên.
         # =========================================================
@@ -187,9 +174,7 @@ class AdaptivePID2REnv(gym.Env):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Chuyển action [-1, 1] thành Kp, Ki, Kd.
-
         Công thức:
-
             gain = min_gain
                  + (action + 1) / 2
                  * (max_gain - min_gain)
@@ -238,7 +223,6 @@ class AdaptivePID2REnv(gym.Env):
 
             integral_error
         """
-
         base_observation = np.asarray(
             base_observation,
             dtype=np.float32,
@@ -270,19 +254,13 @@ class AdaptivePID2REnv(gym.Env):
     def calculate_pid_torque(self) -> np.ndarray:
         """
         Tính torque PID cho hai khớp.
-
         error:
             Sai số vị trí góc.
-
         derivative_error:
             Đạo hàm của sai số.
-
         Vì mục tiêu không đổi:
-
             derivative_error = -dq
-
         Torque:
-
             tau = Kp * error
                 + Ki * integral_error
                 + Kd * derivative_error
@@ -492,7 +470,7 @@ def main():
         policy="MlpPolicy",
         env=training_environment,
         learning_rate=3e-4,
-        buffer_size=100_000,
+        buffer_size=5_000,
         learning_starts=1_000,
         batch_size=256,
         tau=0.005,
@@ -505,7 +483,7 @@ def main():
         seed=42,
     )
 
-    total_timesteps = 100_000
+    total_timesteps = 5_000
 
     print(
         f"Starting training for {total_timesteps} timesteps..."

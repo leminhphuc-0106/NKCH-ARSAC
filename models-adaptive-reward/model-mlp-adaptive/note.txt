@@ -1,0 +1,13 @@
+`HMI` là **ứng dụng giao diện điều khiển và giám sát cánh tay robot 2 bậc tự do (2-DOF)** chạy trên Windows, viết bằng C# WinForms/.NET 8. Nói đơn giản: người vận hành nhập lệnh trên máy tính; HMI gửi lệnh qua cổng serial đến ESP32, nhận dữ liệu encoder để hiển thị trạng thái robot.
+
+### Các chức năng chính
+
+- **Điều khiển chuyển động:** cho chạy đến một điểm (POINT), theo đường thẳng (LINE) hoặc đường tròn (CIRCLE). HMI kiểm tra đầu vào, tính toán động học/quỹ đạo rồi gửi các giá trị vị trí khớp qua serial. Với LINE/CIRCLE, HMI còn gửi chuỗi tham số quỹ đạo cho ESP32. Xem `RunPoint`, `RunLine` và `RunCircle`.
+- **Kết nối và an toàn:** chọn COM port/tốc độ truyền, gửi lệnh HOME/STOP; trước khi chạy quỹ đạo, HMI kiểm tra dữ liệu encoder còn mới và vị trí robot nằm trong giới hạn cho phép. Phần điều phối giao diện nằm ở `MainForm.cs`; giao tiếp serial nằm ở `RobotSerialManager.cs`.
+- **Tính toán robot:** gọi thư viện C++ native để tính động học ngược, lập kế hoạch LINE/CIRCLE và mô-men; `RobotMath.cs` chuyển encoder count sang góc khớp và vị trí đầu công tác. Các hàm gọi sang DLL nằm ở `InverseKinematics.cs`.
+- **Giám sát trực quan:** hiển thị góc/count encoder, sai số mục tiêu–thực tế, biểu đồ theo thời gian và hình vẽ robot cùng điểm đích. Các thành phần vẽ là `RobotView.cs` và `RealtimeChart.cs`.
+- **Ghi dữ liệu CSV:** lưu dữ liệu encoder, góc/vị trí, mục tiêu, sai số và các đại lượng phục vụ phân tích. Một số giá trị PID/PWM trong CSV là **ước lượng do PC tính để ghi log**, không phải số đo trực tiếp từ ESP32. Xem `DataLogger.cs`.
+
+**Luồng tổng quát:** nhập lệnh → kiểm tra kết nối và điều kiện chuyển động → tính quỹ đạo → gửi qua serial → nhận telemetry → cập nhật giao diện và ghi CSV. Việc nhận dữ liệu được phân tích bởi `TelemetryParser.cs`.
+
+Lưu ý: HMI có thể đồng bộ tốc độ baud vào cấu hình firmware và PlatformIO, nhưng thay đổi đó **chỉ sửa tệp cấu hình/mã nguồn**; vẫn cần build và nạp lại firmware cho ESP32 để phần cứng dùng baud mới.
