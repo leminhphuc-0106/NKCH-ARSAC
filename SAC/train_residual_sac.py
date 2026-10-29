@@ -47,6 +47,7 @@ class AdaptivePID2REnv(gym.Env):
             int(round(self.gain_update_period / self.dt)),
         )
         self.step_counter = 0
+        self.total_time_step = 0
         # =========================================================
         # 3. Giới hạn hệ số PID
         # Mỗi khớp có:
@@ -232,14 +233,12 @@ class AdaptivePID2REnv(gym.Env):
             self.robot_env.target_q,
             dtype=np.float32,
         )
-
         current_q = np.asarray(
             self.robot_env.q,
             dtype=np.float32,
         )
 
         error = target_q - current_q
-
         observation = np.concatenate(
             [
                 base_observation,
@@ -247,7 +246,6 @@ class AdaptivePID2REnv(gym.Env):
                 self.integral_error,
             ]
         )
-
         return observation.astype(np.float32)
 
     # Tính torque bằng bộ điều khiển PID
@@ -414,6 +412,9 @@ class AdaptivePID2REnv(gym.Env):
         ) = self.robot_env.step(torque_pid)
 
         self.step_counter += 1
+        self.total_time_step += 1
+        if self.total_time_step%500 == 0:
+            print("TỔNG SỐ TIME_STEP HIỆN TẠI: ", self.total_time_step)
 
         observation = self.build_observation(
             base_observation
@@ -443,6 +444,24 @@ class AdaptivePID2REnv(gym.Env):
     # Đóng môi trường
     def close(self):
         self.robot_env.close()
+
+from stable_baselines3.common.callbacks import BaseCallback
+class MyCallback(BaseCallback):
+    def _on_step(self) -> bool:
+        if self.num_timesteps % 500 == 0:
+            import json
+            JSON_PATH = "./Data/reward_log.json"
+
+            with open(JSON_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Lấy dict cuối cùng trong danh sách rewar được tạo
+            last_dict = data[-1]
+            print(last_dict)
+            
+        return True
+
+
 
 
 # Hàm huấn luyện SAC
@@ -489,10 +508,12 @@ def main():
         f"Starting training for {total_timesteps} timesteps..."
     )
 
+    call_back = MyCallback()
     model.learn(
         total_timesteps=total_timesteps,
         log_interval=10,
         progress_bar=True,
+        callback=call_back
     )
 
     # Lưu mô hình

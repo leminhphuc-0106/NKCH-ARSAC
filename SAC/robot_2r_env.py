@@ -359,23 +359,27 @@ class Robot2REnv(gym.Env):
     def _get_reward(
         self,
         action: np.ndarray,
+
     ) -> float:
+        import json
+        JSON_PATH = "./Data/reward_log.json"
+
+        with open(JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Lấy dict cuối cùng trong danh sách rewar được tạo
+        last_dict = data[-1]
         """Calculate the reward."""
-
         error = self.target_q - self.q
-
-        position_cost = 8.0 * float(
+        position_cost = last_dict["w1"] * float(
             np.dot(error, error)
         )
-
-        velocity_cost = 0.15 * float(
+        velocity_cost = last_dict["w2"] * float(
             np.dot(self.dq, self.dq)
         )
-
-        torque_cost = 0.01 * float(
+        torque_cost = last_dict["w3"] * float(
             np.dot(action, action)
         )
-
         reward = -(
             position_cost
             + velocity_cost
@@ -685,3 +689,5 @@ if __name__ == "__main__":
         "Environment smoke test completed."
     )
     env.close()
+
+
