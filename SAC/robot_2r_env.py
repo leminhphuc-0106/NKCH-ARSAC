@@ -369,6 +369,7 @@ class Robot2REnv(gym.Env):
 
         # Lấy dict cuối cùng trong danh sách rewar được tạo
         last_dict = data[-1]
+        
         """Calculate the reward."""
         error = self.target_q - self.q
         position_cost = last_dict["w1"] * float(

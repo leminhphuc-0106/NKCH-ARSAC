@@ -457,8 +457,9 @@ class MyCallback(BaseCallback):
 
             # Lấy dict cuối cùng trong danh sách rewar được tạo
             last_dict = data[-1]
-            print(last_dict)
+            print("Trọng số reward trước khi sửa đổi: ", last_dict)
             
+
         return True
 
 
